@@ -21,6 +21,10 @@ final class AccountStore: ObservableObject {
     private var refreshLoop: Task<Void, Never>?
     private var loginTask: Task<Void, Never>?
 
+    /// All accounts' tokens, read from a single Keychain item once per launch.
+    private var tokenVault: [String: StoredTokens] = [:]
+    private var vaultLoaded = false
+
     init() {
         loadAccounts()
         startRefreshLoop()
@@ -85,7 +89,10 @@ final class AccountStore: ObservableObject {
     func removeAccount(_ account: AccountMeta) {
         accounts.removeAll { $0.id == account.id }
         states[account.id] = nil
-        Keychain.delete(account: account.id)
+        loadVaultIfNeeded()
+        tokenVault[account.id] = nil
+        persistVault()
+        Keychain.delete(account: account.id)  // legacy per-account item, if any
         persistAccounts()
     }
 
@@ -95,8 +102,9 @@ final class AccountStore: ObservableObject {
     }
 
     private func storeLogin(_ result: LoginResult, provider: ProviderID) throws {
-        let data = try JSONEncoder().encode(result.tokens)
-        try Keychain.save(data, account: result.accountID)
+        loadVaultIfNeeded()
+        tokenVault[result.accountID] = result.tokens
+        persistVault()
 
         // Keep the user-chosen label when re-authenticating an existing account.
         let existingLabel = accounts.first(where: { $0.id == result.accountID })?.label
@@ -194,9 +202,8 @@ final class AccountStore: ObservableObject {
     }
 
     private func validAccessToken(for account: AccountMeta) async throws -> String {
-        guard let data = Keychain.load(account: account.id),
-            var tokens = try? JSONDecoder().decode(StoredTokens.self, from: data)
-        else {
+        loadVaultIfNeeded()
+        guard var tokens = tokenVault[account.id] else {
             throw UsageError.unauthorized
         }
 
@@ -205,13 +212,44 @@ final class AccountStore: ObservableObject {
             do {
                 let provider = Providers.provider(for: account.provider)
                 tokens = try await provider.refresh(tokens: tokens)
-                let encoded = try JSONEncoder().encode(tokens)
-                try Keychain.save(encoded, account: account.id)
+                tokenVault[account.id] = tokens
+                persistVault()
             } catch {
                 throw UsageError.unauthorized
             }
         }
         return tokens.accessToken
+    }
+
+    // MARK: - Token vault
+
+    /// Loads the consolidated Keychain item once per launch, migrating any
+    /// legacy per-account items into it (one final round of prompts).
+    private func loadVaultIfNeeded() {
+        guard !vaultLoaded else { return }
+        vaultLoaded = true
+
+        if let data = Keychain.load(account: Keychain.vaultAccount),
+            let decoded = try? JSONDecoder().decode([String: StoredTokens].self, from: data) {
+            tokenVault = decoded
+        }
+
+        var migrated = false
+        for account in accounts where tokenVault[account.id] == nil {
+            if let data = Keychain.load(account: account.id),
+                let tokens = try? JSONDecoder().decode(StoredTokens.self, from: data) {
+                tokenVault[account.id] = tokens
+                Keychain.delete(account: account.id)
+                migrated = true
+            }
+        }
+        if migrated { persistVault() }
+    }
+
+    private func persistVault() {
+        if let data = try? JSONEncoder().encode(tokenVault) {
+            try? Keychain.save(data, account: Keychain.vaultAccount)
+        }
     }
 
     // MARK: - Launch at login

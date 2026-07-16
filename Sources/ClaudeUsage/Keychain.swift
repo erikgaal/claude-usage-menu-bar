@@ -14,6 +14,9 @@ enum KeychainError: LocalizedError {
 
 enum Keychain {
     static let service = "dev.erikgaal.claude-usage"
+    /// Single item holding every account's tokens (accountID → StoredTokens),
+    /// so unlocking the app costs at most one Keychain prompt.
+    static let vaultAccount = "oauth-tokens"
 
     static func save(_ data: Data, account: String) throws {
         let query: [String: Any] = [

@@ -4,6 +4,14 @@ APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
 VERSION = 1.0.0
 RELEASE_ZIP = $(BUILD_DIR)/Claude-Usage-$(VERSION).zip
 
+# Sign with a real identity when available so the app keeps the same code
+# identity across rebuilds (otherwise Keychain re-prompts after every build).
+CODESIGN_ID := $(shell security find-identity -v -p codesigning 2>/dev/null \
+	| awk -F'"' '/Apple Development|Developer ID Application/{print $$2; exit}')
+ifeq ($(CODESIGN_ID),)
+CODESIGN_ID := -
+endif
+
 # Assembles Contents/ from an executable path passed as $(1).
 # Compiles the Icon Composer document into Assets.car (Liquid Glass,
 # macOS 26+) plus a flattened AppIcon.icns fallback for older systems.
@@ -17,7 +25,7 @@ define assemble_bundle
 		--app-icon AppIcon --include-all-app-icons \
 		--platform macosx --minimum-deployment-target 14.0 \
 		--output-partial-info-plist "$(BUILD_DIR)/icon-partial.plist" > /dev/null
-	codesign --force --sign - "$(APP_BUNDLE)"
+	codesign --force --sign "$(CODESIGN_ID)" "$(APP_BUNDLE)"
 endef
 
 .PHONY: build bundle run release clean
