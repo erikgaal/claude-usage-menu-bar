@@ -34,6 +34,7 @@ struct MenuContentView: View {
             footer
         }
         .frame(width: 340)
+        .onAppear { store.refreshIfStale() }
     }
 
     private var header: some View {

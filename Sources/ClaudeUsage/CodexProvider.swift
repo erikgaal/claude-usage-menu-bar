@@ -19,6 +19,9 @@ enum CodexConfig {
         URL(string: "https://chatgpt.com/backend-api/wham/usage")!,
         URL(string: "https://chatgpt.com/backend-api/api/codex/usage")!,
     ]
+    /// Index of the last usage URL that returned 200, so polling doesn't
+    /// probe dead routes every cycle. Benign if racy.
+    nonisolated(unsafe) static var preferredUsageURLIndex = 0
 }
 
 struct CodexProvider: UsageProvider {
@@ -216,9 +219,12 @@ struct CodexProvider: UsageProvider {
 
     func fetchLimits(accessToken: String, accountID: String) async throws -> [LimitStatus] {
         var lastError: Error = UsageError.http(0, "No usage URL configured")
+        let urlCount = CodexConfig.usageURLs.count
+        let startIndex = CodexConfig.preferredUsageURLIndex
 
-        for url in CodexConfig.usageURLs {
-            var request = URLRequest(url: url)
+        for offset in 0..<urlCount {
+            let index = (startIndex + offset) % urlCount
+            var request = URLRequest(url: CodexConfig.usageURLs[index])
             request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
             request.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id")
             request.setValue("codex_cli_rs", forHTTPHeaderField: "originator")
@@ -226,14 +232,22 @@ struct CodexProvider: UsageProvider {
             request.timeoutInterval = 15
 
             let (data, response) = try await URLSession.shared.data(for: request)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let http = response as? HTTPURLResponse
+            let status = http?.statusCode ?? 0
             if status == 401 {
                 throw UsageError.unauthorized
             }
+            if status == 429 {
+                throw UsageError.rateLimited(until: http?.retryAfterDate ?? Date() + 300)
+            }
             guard status == 200 else {
                 lastError = UsageError.http(status, String(data: data, encoding: .utf8) ?? "")
-                continue
+                // Only try the alternative route when this one doesn't exist;
+                // other failures apply to the account, not the routing style.
+                if status == 404 || status == 405 { continue }
+                throw lastError
             }
+            CodexConfig.preferredUsageURLIndex = index
             let parsed = try JSONDecoder().decode(CodexUsageResponse.self, from: data)
             return Self.buildLimits(parsed)
         }

@@ -12,6 +12,12 @@ final class AccountStore: ObservableObject {
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
 
     private let defaultsKey = "accounts"
+    /// Background poll cadence. The panel also refreshes on open when stale.
+    private let pollInterval: TimeInterval = 300
+    /// Consider data stale (worth refreshing on panel open) after this long.
+    private let staleAfter: TimeInterval = 120
+    /// Per-account backoff deadlines set by 429 responses.
+    private var cooldownUntil: [String: Date] = [:]
     private var refreshLoop: Task<Void, Never>?
     private var loginTask: Task<Void, Never>?
 
@@ -98,33 +104,58 @@ final class AccountStore: ObservableObject {
         states[meta.id] = state
         persistAccounts()
 
-        Task { await self.refresh(account: meta) }
+        Task { await self.refresh(account: meta, force: true) }
     }
 
     // MARK: - Refresh
 
+    /// Manual refresh: retries everything, ignoring cooldowns and reauth state.
     func refreshNow() {
-        Task { await refreshAll() }
+        Task { await refreshAll(force: true) }
+    }
+
+    /// Called when the panel opens: refresh only what's stale, respecting
+    /// cooldowns, so opening the menu never causes a request burst.
+    func refreshIfStale() {
+        Task {
+            await withTaskGroup(of: Void.self) { group in
+                for account in accounts {
+                    let updated = states[account.id]?.lastUpdated
+                    guard updated == nil
+                        || Date().timeIntervalSince(updated!) > staleAfter
+                    else { continue }
+                    group.addTask { await self.refresh(account: account, force: false) }
+                }
+            }
+        }
     }
 
     private func startRefreshLoop() {
         refreshLoop = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.refreshAll()
-                try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                await self?.refreshAll(force: false)
+                let interval = self?.pollInterval ?? 300
+                try? await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000_000)
             }
         }
     }
 
-    private func refreshAll() async {
+    private func refreshAll(force: Bool) async {
         await withTaskGroup(of: Void.self) { group in
             for account in accounts {
-                group.addTask { await self.refresh(account: account) }
+                group.addTask { await self.refresh(account: account, force: force) }
             }
         }
     }
 
-    private func refresh(account: AccountMeta) async {
+    private func refresh(account: AccountMeta, force: Bool) async {
+        if !force {
+            // Don't hammer the token endpoint for accounts that need the user,
+            // and honor 429 backoff deadlines.
+            if states[account.id]?.needsReauth == true { return }
+            if let cooldown = cooldownUntil[account.id], cooldown > Date() { return }
+        }
+
         var state = states[account.id] ?? AccountDisplayState()
         do {
             let provider = Providers.provider(for: account.provider)
@@ -135,9 +166,13 @@ final class AccountStore: ObservableObject {
             state.lastUpdated = Date()
             state.error = nil
             state.needsReauth = false
+            cooldownUntil[account.id] = nil
         } catch UsageError.unauthorized {
             state.error = "Sign-in expired"
             state.needsReauth = true
+        } catch UsageError.rateLimited(let until) {
+            cooldownUntil[account.id] = until
+            state.error = UsageError.rateLimited(until: until).localizedDescription
         } catch {
             state.error = error.localizedDescription
         }

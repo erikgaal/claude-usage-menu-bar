@@ -2,15 +2,29 @@ import Foundation
 
 enum UsageError: LocalizedError {
     case unauthorized
+    case rateLimited(until: Date)
     case http(Int, String)
 
     var errorDescription: String? {
         switch self {
         case .unauthorized:
             return "Session expired — sign in again."
+        case .rateLimited(let until):
+            return "Rate limited — retrying after \(until.formatted(date: .omitted, time: .shortened))"
         case .http(let code, let body):
             return "Usage request failed (HTTP \(code)): \(body.prefix(120))"
         }
+    }
+}
+
+extension HTTPURLResponse {
+    /// Backoff deadline for a 429, honoring Retry-After when present.
+    var retryAfterDate: Date {
+        if let value = value(forHTTPHeaderField: "Retry-After"),
+            let seconds = TimeInterval(value) {
+            return Date().addingTimeInterval(max(30, seconds))
+        }
+        return Date().addingTimeInterval(300)
     }
 }
 
@@ -25,9 +39,13 @@ enum UsageAPI {
         request.timeoutInterval = 15
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let http = response as? HTTPURLResponse
+        let status = http?.statusCode ?? 0
         if status == 401 || status == 403 {
             throw UsageError.unauthorized
+        }
+        if status == 429 {
+            throw UsageError.rateLimited(until: http?.retryAfterDate ?? Date() + 300)
         }
         guard status == 200 else {
             throw UsageError.http(status, String(data: data, encoding: .utf8) ?? "")

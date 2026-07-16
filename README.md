@@ -30,8 +30,12 @@ accepts native `URLSession` traffic, which is what the app uses.
 
 Tokens live in your login Keychain (service `dev.erikgaal.claude-usage`, one
 item per account) and are isolated from the CLIs' own logins. Only account
-email/UUID/provider metadata is kept in UserDefaults. The app polls every 60
-seconds.
+email/UUID/provider metadata is kept in UserDefaults.
+
+Polling: every 5 minutes in the background, plus a refresh when the panel is
+opened with data older than 2 minutes. A 429 response puts that account on a
+cooldown (honoring `Retry-After`), and accounts whose sign-in expired are not
+retried automatically. The ⟳ button forces a refresh of everything.
 
 The menu bar shows one number per account: that account's most-used limit
 (e.g. `21·35%`). The dropdown shows every limit with a progress bar and reset
