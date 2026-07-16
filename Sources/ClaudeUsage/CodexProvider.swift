@@ -285,11 +285,11 @@ struct CodexProvider: UsageProvider {
             let hasBoth = details?.primaryWindow != nil && details?.secondaryWindow != nil
             add(
                 details?.primaryWindow,
-                label: hasBoth ? "\(base) · session" : base,
+                label: hasBoth ? "\(base) 5h" : base,
                 sortOrder: 2 + index, idPrefix: "extra-p\(index)")
             add(
                 details?.secondaryWindow,
-                label: hasBoth ? "\(base) · weekly" : base,
+                label: hasBoth ? "\(base) 7d" : base,
                 sortOrder: 2 + index, idPrefix: "extra-s\(index)")
         }
 
@@ -299,8 +299,8 @@ struct CodexProvider: UsageProvider {
     static func windowName(seconds: Double?) -> String {
         guard let seconds, seconds > 0 else { return "Window" }
         let hours = Int((seconds / 3600).rounded())
-        if hours <= 24 { return "Session (\(hours)h)" }
+        if hours <= 24 { return "Session" }
         let days = Int((seconds / 86400).rounded())
-        return days == 7 ? "Weekly" : "\(days)-day window"
+        return days == 7 ? "Weekly" : "\(days)-day"
     }
 }

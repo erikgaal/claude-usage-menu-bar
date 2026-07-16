@@ -46,6 +46,10 @@ final class AccountStore: ObservableObject {
         accounts.compactMap { states[$0.id]?.limits.map(\.percent).max() }.max() ?? 0
     }
 
+    var lastUpdatedOverall: Date? {
+        accounts.compactMap { states[$0.id]?.lastUpdated }.max()
+    }
+
     // MARK: - Account management
 
     func beginAddAccount(provider providerID: ProviderID) {
@@ -71,6 +75,13 @@ final class AccountStore: ObservableObject {
         loginTask?.cancel()
     }
 
+    func rename(_ account: AccountMeta, to label: String) {
+        guard let index = accounts.firstIndex(where: { $0.id == account.id }) else { return }
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        accounts[index].label = trimmed.isEmpty ? nil : trimmed
+        persistAccounts()
+    }
+
     func removeAccount(_ account: AccountMeta) {
         accounts.removeAll { $0.id == account.id }
         states[account.id] = nil
@@ -87,11 +98,14 @@ final class AccountStore: ObservableObject {
         let data = try JSONEncoder().encode(result.tokens)
         try Keychain.save(data, account: result.accountID)
 
+        // Keep the user-chosen label when re-authenticating an existing account.
+        let existingLabel = accounts.first(where: { $0.id == result.accountID })?.label
         let meta = AccountMeta(
             id: result.accountID,
             email: result.email,
             organizationName: result.organizationName,
-            provider: provider
+            provider: provider,
+            label: existingLabel
         )
         if let index = accounts.firstIndex(where: { $0.id == meta.id }) {
             accounts[index] = meta

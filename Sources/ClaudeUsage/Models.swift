@@ -7,21 +7,30 @@ struct AccountMeta: Codable, Identifiable, Equatable {
     var email: String
     var organizationName: String?
     var provider: ProviderID
+    /// User-chosen display name ("Work", "Personal"); nil → provider name.
+    var label: String?
 
-    init(id: String, email: String, organizationName: String?, provider: ProviderID) {
+    var displayLabel: String { label ?? provider.displayName }
+
+    init(
+        id: String, email: String, organizationName: String?, provider: ProviderID,
+        label: String? = nil
+    ) {
         self.id = id
         self.email = email
         self.organizationName = organizationName
         self.provider = provider
+        self.label = label
     }
 
-    // Accounts saved before multi-provider support have no `provider` key.
+    // Accounts saved before multi-provider/label support lack those keys.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         email = try container.decode(String.self, forKey: .email)
         organizationName = try container.decodeIfPresent(String.self, forKey: .organizationName)
         provider = try container.decodeIfPresent(ProviderID.self, forKey: .provider) ?? .claude
+        label = try container.decodeIfPresent(String.self, forKey: .label)
     }
 }
 

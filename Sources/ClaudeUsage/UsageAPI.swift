@@ -68,13 +68,13 @@ enum UsageAPI {
                 let sortOrder: Int
                 switch (limit.kind, modelName) {
                 case ("session", _):
-                    name = "Session (5h)"
+                    name = "Session"
                     sortOrder = 0
                 case ("weekly_all", _):
-                    name = "Weekly · all models"
+                    name = "Weekly"
                     sortOrder = 1
                 case (_, .some(let model)):
-                    name = "Weekly · \(model)"
+                    name = model
                     sortOrder = 2
                 default:
                     let kind = limit.kind ?? limit.group ?? "limit"
@@ -93,10 +93,10 @@ enum UsageAPI {
             }
         } else {
             let windows: [(String, UsageResponse.Window?, Int)] = [
-                ("Session (5h)", response.fiveHour, 0),
-                ("Weekly · all models", response.sevenDay, 1),
-                ("Weekly · Opus", response.sevenDayOpus, 2),
-                ("Weekly · Sonnet", response.sevenDaySonnet, 3),
+                ("Session", response.fiveHour, 0),
+                ("Weekly", response.sevenDay, 1),
+                ("Opus", response.sevenDayOpus, 2),
+                ("Sonnet", response.sevenDaySonnet, 3),
             ]
             for (name, window, sortOrder) in windows {
                 guard let window, let utilization = window.utilization else { continue }
