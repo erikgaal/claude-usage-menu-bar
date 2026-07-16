@@ -1,0 +1,70 @@
+# Claude Usage — menu bar app
+
+A tiny macOS menu bar app that shows the rate-limit usage of your AI coding
+subscriptions — multiple accounts side by side:
+
+- **Claude** (claude.ai subscription): 5-hour session limit, weekly limit,
+  and model-scoped weekly limits (e.g. Fable).
+- **Codex** (ChatGPT subscription): 5-hour session window, weekly window,
+  and any additional named limits.
+
+## How it works
+
+Each provider implements a small `UsageProvider` protocol (login, token
+refresh, fetch limits); everything else — Keychain storage, polling, menu bar
+summary, UI — is provider-agnostic.
+
+**Claude** uses the same OAuth flow as Claude Code's `/login` (PKCE against
+`claude.com/cai/oauth/authorize` with Claude Code's public client ID, token
+exchange at `platform.claude.com/v1/oauth/token`, callback on
+`localhost:54545/callback`). Usage comes from
+`GET api.anthropic.com/api/oauth/usage` — the endpoint behind `/usage` in
+Claude Code.
+
+**Codex** uses the same OAuth flow as `codex login` (PKCE against
+`auth.openai.com/oauth/authorize` with the Codex CLI's public client ID,
+callback on `localhost:1455/auth/callback`). Usage comes from
+`GET chatgpt.com/backend-api/wham/usage` — the endpoint behind `/status` in
+the Codex CLI. Note: this backend rejects curl/scripts (bot detection) but
+accepts native `URLSession` traffic, which is what the app uses.
+
+Tokens live in your login Keychain (service `dev.erikgaal.claude-usage`, one
+item per account) and are isolated from the CLIs' own logins. Only account
+email/UUID/provider metadata is kept in UserDefaults. The app polls every 60
+seconds.
+
+The menu bar shows one number per account: that account's most-used limit
+(e.g. `21·35%`). The dropdown shows every limit with a progress bar and reset
+time.
+
+## Build & run
+
+```sh
+make run      # builds, bundles build/Claude Usage.app, and opens it
+```
+
+Or step by step: `make build` (swift build), `make bundle` (assemble + ad-hoc
+codesign the .app), `make clean`.
+
+Requires macOS 14+ and Xcode command line tools. No dependencies.
+
+## Adding accounts
+
+1. Click the gauge icon → **Add Claude Account…** or **Add Codex Account…** —
+   your browser opens the provider's authorization page. Approve, and the app
+   picks up the callback.
+2. For a **second account on the same provider**: the browser will be logged
+   into the first account, so use a private window or log out first.
+
+If a refresh token expires the account row shows "Sign-in expired" with a
+button to re-authenticate.
+
+## Notes
+
+- "Launch at login" uses `SMAppService` and only works when running from the
+  bundled `.app` (i.e. via `make run`, not `swift run`). For it to survive
+  rebuilds, consider copying `build/Claude Usage.app` to `/Applications`.
+- Endpoints and OAuth constants were extracted from the Claude Code 2.1.211
+  binary and the open-source `openai/codex` repo (codex-rs `login/src/server.rs`,
+  `backend-client/src/client/rate_limit_resets.rs`). If a provider changes
+  them, update `OAuthConfig` / `CodexConfig`.
