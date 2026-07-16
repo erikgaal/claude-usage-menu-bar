@@ -56,11 +56,41 @@ launch. One-time fix:
 
 Or from a terminal instead: `xattr -d com.apple.quarantine "/Applications/Claude Usage.app"`.
 
+## Notarizing (removes the Gatekeeper step)
+
+Anyone on the paid Apple Developer Program can produce a notarized build
+that installs with zero warnings. One-time setup on their machine:
+
+1. **Developer ID Application certificate** in the login keychain. Only the
+   team's Account Holder can create one: [developer.apple.com/account →
+   Certificates](https://developer.apple.com/account/resources/certificates)
+   → “+” → *Developer ID Application* (upload a CSR from Keychain Access).
+2. **Notarytool credentials**, using an app-specific password from
+   [account.apple.com](https://account.apple.com) → Sign-In and Security:
+
+   ```sh
+   xcrun notarytool store-credentials claude-usage \
+     --apple-id you@example.com --team-id TEAMID --password <app-specific>
+   ```
+
+Then, from a clone of this repo:
+
+```sh
+make notarize   # signs with Developer ID, submits to Apple, staples, re-zips
+```
+
+The build automatically prefers a Developer ID identity when one is present
+and signs with hardened runtime + timestamp (notarization requirements).
+Verify with `spctl -a -vv "build/Claude Usage.app"` — it should print
+`source=Notarized Developer ID`. The resulting zip opens on any Mac without
+the "Open Anyway" step.
+
 ## Build & run from source
 
 ```sh
-make run      # builds, bundles build/Claude Usage.app, and opens it
-make release  # universal (arm64 + x86_64) zip in build/
+make run       # builds, bundles build/Claude Usage.app, and opens it
+make release   # universal (arm64 + x86_64) zip in build/
+make notarize  # release + Apple notarization (needs Developer ID, see above)
 ```
 
 Or step by step: `make build` (swift build), `make bundle` (assemble + ad-hoc
