@@ -37,10 +37,26 @@ The menu bar shows one number per account: that account's most-used limit
 (e.g. `21·35%`). The dropdown shows every limit with a progress bar and reset
 time.
 
-## Build & run
+## Install (prebuilt app)
+
+Grab `Claude-Usage-x.y.z.zip` from the
+[releases page](https://github.com/erikgaal/claude-usage-menu-bar/releases),
+unzip, and drag **Claude Usage.app** into `/Applications`.
+
+The app is ad-hoc signed (not notarized), so macOS will block the first
+launch. One-time fix:
+
+1. Double-click the app (macOS shows "cannot verify" — dismiss it),
+2. open **System Settings → Privacy & Security**, scroll down, and click
+   **Open Anyway** next to "Claude Usage".
+
+Or from a terminal instead: `xattr -d com.apple.quarantine "/Applications/Claude Usage.app"`.
+
+## Build & run from source
 
 ```sh
 make run      # builds, bundles build/Claude Usage.app, and opens it
+make release  # universal (arm64 + x86_64) zip in build/
 ```
 
 Or step by step: `make build` (swift build), `make bundle` (assemble + ad-hoc
