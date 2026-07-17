@@ -8,6 +8,13 @@ subscriptions — multiple accounts side by side:
 - **Codex** (ChatGPT subscription): 5-hour session window, weekly window,
   and any additional named limits.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+    <img alt="The Claude Usage panel showing three accounts (Claude Work, Claude Personal, and Codex) with per-limit usage bars and reset times" src="docs/screenshot-light.png" width="436">
+  </picture>
+</p>
+
 ## How it works
 
 Each provider implements a small `UsageProvider` protocol (login, token
