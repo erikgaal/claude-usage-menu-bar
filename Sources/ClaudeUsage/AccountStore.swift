@@ -26,6 +26,14 @@ final class AccountStore: ObservableObject {
     private var vaultLoaded = false
 
     init() {
+        #if DEBUG
+            if Mock.isEnabled {
+                accounts = Mock.accounts
+                states = Mock.states
+                vaultLoaded = true
+                return
+            }
+        #endif
         loadAccounts()
         startRefreshLoop()
     }

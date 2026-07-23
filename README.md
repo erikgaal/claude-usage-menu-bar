@@ -97,9 +97,10 @@ the "Open Anyway" step.
 ## Build & run from source
 
 ```sh
-make run       # builds, bundles build/Claude Usage.app, and opens it
-make release   # universal (arm64 + x86_64) zip in build/
-make notarize  # release + Apple notarization (needs Developer ID, see above)
+make run          # builds, bundles build/Claude Usage.app, and opens it
+make release      # universal (arm64 + x86_64) zip in build/
+make notarize     # release + Apple notarization (needs Developer ID, see above)
+make screenshots  # regenerate docs/screenshot-{light,dark}.png from mock data
 ```
 
 Or step by step: `make build` (swift build), `make bundle` (assemble + ad-hoc
