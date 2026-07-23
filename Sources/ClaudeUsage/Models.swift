@@ -52,9 +52,61 @@ struct LimitStatus: Identifiable, Equatable {
     let sortOrder: Int
 }
 
+/// Extra-usage ("credits") spend for an account, rendered as its own bar.
+/// Amounts are in minor currency units (e.g. pence). `limitMinor` is the spend
+/// cap when one is set — nil means uncapped, so the bar has no denominator to
+/// fill and only the spent amount is meaningful.
+struct CreditsStatus: Equatable {
+    let usedMinor: Int
+    let limitMinor: Int?
+    let currency: String
+    let exponent: Int
+    /// Server-computed cap consumption (0 when uncapped); used only as a
+    /// fallback when we can't compute used/limit ourselves.
+    let percent: Double?
+    let enabled: Bool
+
+    var hasCap: Bool { (limitMinor ?? 0) > 0 }
+
+    /// Bar fill: used/cap when a cap exists, else the server percent (≈0).
+    var fillPercent: Double {
+        if let limitMinor, limitMinor > 0 {
+            return min(100, Double(usedMinor) / Double(limitMinor) * 100)
+        }
+        return percent ?? 0
+    }
+
+    /// Only worth showing when the feature is on and there's something to see
+    /// (money spent or a cap to track) — hides idle £0/no-cap accounts.
+    var isMeaningful: Bool { enabled && (usedMinor > 0 || hasCap) }
+
+    var usedText: String { Self.money(usedMinor, currency: currency, exponent: exponent) }
+    var limitText: String? {
+        limitMinor.map { Self.money($0, currency: currency, exponent: exponent) }
+    }
+
+    private static func money(_ minor: Int, currency: String, exponent: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = currency
+        formatter.minimumFractionDigits = exponent
+        formatter.maximumFractionDigits = exponent
+        let value = Double(minor) / pow(10.0, Double(exponent))
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+}
+
+/// One fetch's worth of an account's usage: rate-limit windows plus optional
+/// extra-usage credits. Providers with no credits concept leave it nil.
+struct UsageSnapshot: Equatable {
+    var limits: [LimitStatus]
+    var credits: CreditsStatus?
+}
+
 /// Per-account UI state.
 struct AccountDisplayState: Equatable {
     var limits: [LimitStatus] = []
+    var credits: CreditsStatus?
     var lastUpdated: Date?
     var error: String?
     var needsReauth: Bool = false
@@ -100,18 +152,67 @@ struct UsageResponse: Decodable {
         }
     }
 
+    /// A monetary amount, e.g. `{ "amount_minor": 657, "currency": "GBP", "exponent": 2 }`.
+    struct Money: Decodable {
+        let amountMinor: Int
+        let currency: String?
+        let exponent: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case amountMinor = "amount_minor"
+            case currency, exponent
+        }
+    }
+
+    /// Newer, richer extra-usage block. Preferred over `extraUsage`.
+    struct Spend: Decodable {
+        /// `cap` nests its amount a level deeper than `limit` does:
+        /// `{ "money": { "amount_minor": … }, "credits": null }`.
+        struct Cap: Decodable {
+            let money: Money?
+        }
+
+        let used: Money?
+        let limit: Money?
+        let cap: Cap?
+        let percent: Double?
+        let enabled: Bool?
+    }
+
+    /// Legacy extra-usage block; fallback when `spend` is absent. Amounts are
+    /// already in minor units (`used_credits: 657.0` == 657 pence).
+    struct ExtraUsage: Decodable {
+        let isEnabled: Bool?
+        let usedCredits: Double?
+        let monthlyLimit: Double?
+        let utilization: Double?
+        let currency: String?
+        let decimalPlaces: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case isEnabled = "is_enabled"
+            case usedCredits = "used_credits"
+            case monthlyLimit = "monthly_limit"
+            case utilization, currency
+            case decimalPlaces = "decimal_places"
+        }
+    }
+
     let fiveHour: Window?
     let sevenDay: Window?
     let sevenDayOpus: Window?
     let sevenDaySonnet: Window?
     let limits: [Limit]?
+    let spend: Spend?
+    let extraUsage: ExtraUsage?
 
     enum CodingKeys: String, CodingKey {
-        case limits
+        case limits, spend
         case fiveHour = "five_hour"
         case sevenDay = "seven_day"
         case sevenDayOpus = "seven_day_opus"
         case sevenDaySonnet = "seven_day_sonnet"
+        case extraUsage = "extra_usage"
     }
 }
 

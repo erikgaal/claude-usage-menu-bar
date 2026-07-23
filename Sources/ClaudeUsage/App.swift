@@ -1,7 +1,22 @@
 import AppKit
 import SwiftUI
 
+/// Real entry point. Normally runs the menu bar app; in DEBUG builds a
+/// `--render-screenshots` flag diverts to the offline screenshot renderer
+/// (used to regenerate the README images from mock data) and exits.
 @main
+enum AppEntry {
+    static func main() {
+        #if DEBUG
+        if CommandLine.arguments.contains("--render-screenshots") {
+            MainActor.assumeIsolated { ScreenshotRenderer.run() }
+            return
+        }
+        #endif
+        ClaudeUsageApp.main()
+    }
+}
+
 struct ClaudeUsageApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = AccountStore()

@@ -42,10 +42,16 @@ define assemble_bundle
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" "$(APP_BUNDLE)"
 endef
 
-.PHONY: build bundle run release notarize clean
+.PHONY: build bundle run release notarize screenshots clean
 
 build:
 	swift build -c release
+
+# Regenerate the README panel images (docs/screenshot-{light,dark}.png) from
+# mock data. DEBUG build so the offline renderer is compiled in.
+screenshots:
+	swift build
+	.build/debug/ClaudeUsage --render-screenshots
 
 bundle: build
 	$(call assemble_bundle,.build/release/ClaudeUsage)

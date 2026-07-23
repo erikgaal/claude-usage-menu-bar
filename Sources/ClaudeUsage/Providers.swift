@@ -21,7 +21,7 @@ protocol UsageProvider: Sendable {
     var accountKind: String { get }
     func login() async throws -> LoginResult
     func refresh(tokens: StoredTokens) async throws -> StoredTokens
-    func fetchLimits(accessToken: String, accountID: String) async throws -> [LimitStatus]
+    func fetchUsage(accessToken: String, accountID: String) async throws -> UsageSnapshot
 }
 
 enum Providers {
@@ -48,8 +48,8 @@ struct ClaudeProvider: UsageProvider {
         try await OAuthClient.refresh(refreshToken: tokens.refreshToken).tokens
     }
 
-    func fetchLimits(accessToken: String, accountID: String) async throws -> [LimitStatus] {
-        try await UsageAPI.fetchLimits(accessToken: accessToken)
+    func fetchUsage(accessToken: String, accountID: String) async throws -> UsageSnapshot {
+        try await UsageAPI.fetchUsage(accessToken: accessToken)
     }
 }
 

@@ -1,7 +1,23 @@
 import SwiftUI
 
+/// When true, interactive controls render as static look-alikes so the panel
+/// can be rasterized offscreen by `ImageRenderer` for the README screenshots
+/// (live AppKit buttons/toggles don't survive offscreen rendering). Always
+/// false in the running app.
+private struct ScreenshotModeKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var screenshotMode: Bool {
+        get { self[ScreenshotModeKey.self] }
+        set { self[ScreenshotModeKey.self] = newValue }
+    }
+}
+
 struct MenuContentView: View {
     @ObservedObject var store: AccountStore
+    @Environment(\.screenshotMode) private var screenshotMode
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -51,13 +67,17 @@ struct MenuContentView: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            Button {
-                store.refreshNow()
-            } label: {
+            if screenshotMode {
                 Image(systemName: "arrow.clockwise")
+            } else {
+                Button {
+                    store.refreshNow()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Refresh now")
             }
-            .buttonStyle(.borderless)
-            .help("Refresh now")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -102,16 +122,20 @@ struct MenuContentView: View {
     private var addButtons: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(ProviderID.allCases, id: \.self) { providerID in
-                Button {
-                    store.beginAddAccount(provider: providerID)
-                } label: {
-                    Label(
-                        "Add \(providerID.displayName) account",
-                        systemImage: "plus.app")
+                let label = Label(
+                    "Add \(providerID.displayName) account", systemImage: "plus.app")
+                if screenshotMode {
+                    label.foregroundStyle(.primary)
+                } else {
+                    Button {
+                        store.beginAddAccount(provider: providerID)
+                    } label: {
+                        label
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.primary)
+                    .disabled(store.isAddingAccount)
                 }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.primary)
-                .disabled(store.isAddingAccount)
             }
         }
         .padding(.horizontal, 14)
@@ -123,18 +147,28 @@ struct MenuContentView: View {
             HStack {
                 Text("Launch at login")
                 Spacer()
-                Toggle("", isOn: launchAtLoginBinding)
-                    .labelsHidden()
-                    .toggleStyle(.checkbox)
+                if screenshotMode {
+                    Image(systemName: "checkmark.square.fill")
+                        .foregroundStyle(Color(nsColor: .controlAccentColor))
+                } else {
+                    Toggle("", isOn: launchAtLoginBinding)
+                        .labelsHidden()
+                        .toggleStyle(.checkbox)
+                }
             }
             HStack {
                 Spacer()
-                Button("Quit") {
-                    NSApplication.shared.terminate(nil)
+                if screenshotMode {
+                    Text("Quit")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button("Quit") {
+                        NSApplication.shared.terminate(nil)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .keyboardShortcut("q")
                 }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .keyboardShortcut("q")
             }
         }
         .padding(.horizontal, 14)
@@ -189,6 +223,9 @@ struct AccountSection: View {
                 }
             } else {
                 limitGroups
+                if let credits = state.credits, credits.isMeaningful {
+                    CreditsRow(credits: credits)
+                }
                 if let error = state.error {
                     Text(error)
                         .font(.caption2)
@@ -355,6 +392,9 @@ struct ProviderBadge: View {
 struct LimitRow: View {
     static let labelWidth: CGFloat = 64
     static let spacing: CGFloat = 10
+    /// Width of the trailing value column, shared with `CreditsRow` so every
+    /// bar spans the same width (wide enough for a currency amount).
+    static let valueWidth: CGFloat = 60
 
     let limit: LimitStatus
 
@@ -369,12 +409,57 @@ struct LimitRow: View {
                 .font(.callout.weight(.semibold))
                 .monospacedDigit()
                 .foregroundStyle(barColor)
-                .frame(width: 44, alignment: .trailing)
+                .frame(width: Self.valueWidth, alignment: .trailing)
         }
     }
 
     private var barColor: Color {
         switch limit.percent {
+        case 90...: return .red
+        case 70..<90: return .orange
+        default: return .green
+        }
+    }
+}
+
+/// Extra-usage ("credits") spend. When a cap is set the bar fills used/cap;
+/// with no cap there's no denominator, so the bar stays on its empty track and
+/// the caption explains why, while the amount spent is always shown.
+struct CreditsRow: View {
+    let credits: CreditsStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: LimitRow.spacing) {
+                Text("Credits")
+                    .font(.callout)
+                    .lineLimit(1)
+                    .frame(width: LimitRow.labelWidth, alignment: .leading)
+                UsageBar(percent: credits.fillPercent, color: barColor)
+                Text(credits.usedText)
+                    .font(.callout.weight(.semibold))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .foregroundStyle(credits.hasCap ? barColor : .primary)
+                    .frame(width: LimitRow.valueWidth, alignment: .trailing)
+            }
+            Text(caption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, LimitRow.labelWidth + LimitRow.spacing)
+        }
+    }
+
+    private var caption: String {
+        guard let limitText = credits.limitText else {
+            return "extra usage · no spend limit"
+        }
+        return "extra usage · \(Int(credits.fillPercent.rounded()))% of \(limitText)"
+    }
+
+    private var barColor: Color {
+        guard credits.hasCap else { return .secondary }
+        switch credits.fillPercent {
         case 90...: return .red
         case 70..<90: return .orange
         default: return .green
