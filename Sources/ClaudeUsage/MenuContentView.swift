@@ -189,6 +189,9 @@ struct AccountSection: View {
                 }
             } else {
                 limitGroups
+                if let credits = state.credits, credits.isMeaningful {
+                    CreditsRow(credits: credits)
+                }
                 if let error = state.error {
                     Text(error)
                         .font(.caption2)
@@ -355,6 +358,9 @@ struct ProviderBadge: View {
 struct LimitRow: View {
     static let labelWidth: CGFloat = 64
     static let spacing: CGFloat = 10
+    /// Width of the trailing value column, shared with `CreditsRow` so every
+    /// bar spans the same width (wide enough for a currency amount).
+    static let valueWidth: CGFloat = 60
 
     let limit: LimitStatus
 
@@ -369,12 +375,57 @@ struct LimitRow: View {
                 .font(.callout.weight(.semibold))
                 .monospacedDigit()
                 .foregroundStyle(barColor)
-                .frame(width: 44, alignment: .trailing)
+                .frame(width: Self.valueWidth, alignment: .trailing)
         }
     }
 
     private var barColor: Color {
         switch limit.percent {
+        case 90...: return .red
+        case 70..<90: return .orange
+        default: return .green
+        }
+    }
+}
+
+/// Extra-usage ("credits") spend. When a cap is set the bar fills used/cap;
+/// with no cap there's no denominator, so the bar stays on its empty track and
+/// the caption explains why, while the amount spent is always shown.
+struct CreditsRow: View {
+    let credits: CreditsStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: LimitRow.spacing) {
+                Text("Credits")
+                    .font(.callout)
+                    .lineLimit(1)
+                    .frame(width: LimitRow.labelWidth, alignment: .leading)
+                UsageBar(percent: credits.fillPercent, color: barColor)
+                Text(credits.usedText)
+                    .font(.callout.weight(.semibold))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .foregroundStyle(credits.hasCap ? barColor : .primary)
+                    .frame(width: LimitRow.valueWidth, alignment: .trailing)
+            }
+            Text(caption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, LimitRow.labelWidth + LimitRow.spacing)
+        }
+    }
+
+    private var caption: String {
+        guard let limitText = credits.limitText else {
+            return "extra usage · no spend limit"
+        }
+        return "extra usage · \(Int(credits.fillPercent.rounded()))% of \(limitText)"
+    }
+
+    private var barColor: Color {
+        guard credits.hasCap else { return .secondary }
+        switch credits.fillPercent {
         case 90...: return .red
         case 70..<90: return .orange
         default: return .green

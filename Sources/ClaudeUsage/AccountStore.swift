@@ -26,6 +26,14 @@ final class AccountStore: ObservableObject {
     private var vaultLoaded = false
 
     init() {
+        #if DEBUG
+            if Mock.isEnabled {
+                accounts = Mock.accounts
+                states = Mock.states
+                vaultLoaded = true
+                return
+            }
+        #endif
         loadAccounts()
         startRefreshLoop()
     }
@@ -182,9 +190,10 @@ final class AccountStore: ObservableObject {
         do {
             let provider = Providers.provider(for: account.provider)
             let token = try await validAccessToken(for: account)
-            let limits = try await provider.fetchLimits(
+            let snapshot = try await provider.fetchUsage(
                 accessToken: token, accountID: account.id)
-            state.limits = limits
+            state.limits = snapshot.limits
+            state.credits = snapshot.credits
             state.lastUpdated = Date()
             state.error = nil
             state.needsReauth = false

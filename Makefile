@@ -42,7 +42,7 @@ define assemble_bundle
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" "$(APP_BUNDLE)"
 endef
 
-.PHONY: build bundle run release notarize clean
+.PHONY: build bundle run release notarize screenshots clean
 
 build:
 	swift build -c release
@@ -76,6 +76,16 @@ notarize: release
 	rm -f "$(RELEASE_ZIP)"
 	ditto -c -k --sequesterRsrc --keepParent "$(APP_BUNDLE)" "$(RELEASE_ZIP)"
 	@echo "Notarized artifact: $(RELEASE_ZIP)"
+
+# Regenerates docs/screenshot-{light,dark}.png from mock data (debug-only,
+# see Sources/ClaudeUsage/MockSupport.swift). Briefly opens the panel on
+# screen; captures only the app's own window, so nothing else can leak in.
+screenshots:
+	swift build
+	CLAUDE_USAGE_MOCK=1 CLAUDE_USAGE_APPEARANCE=light \
+		CLAUDE_USAGE_SHOT=docs/screenshot-light.png .build/debug/ClaudeUsage
+	CLAUDE_USAGE_MOCK=1 CLAUDE_USAGE_APPEARANCE=dark \
+		CLAUDE_USAGE_SHOT=docs/screenshot-dark.png .build/debug/ClaudeUsage
 
 clean:
 	rm -rf .build $(BUILD_DIR)

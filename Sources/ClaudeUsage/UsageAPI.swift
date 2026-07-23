@@ -31,7 +31,7 @@ extension HTTPURLResponse {
 enum UsageAPI {
     static let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
-    static func fetchLimits(accessToken: String) async throws -> [LimitStatus] {
+    static func fetchUsage(accessToken: String) async throws -> UsageSnapshot {
         var request = URLRequest(url: endpoint)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
@@ -52,7 +52,35 @@ enum UsageAPI {
         }
 
         let parsed = try JSONDecoder().decode(UsageResponse.self, from: data)
-        return buildLimits(parsed)
+        return UsageSnapshot(limits: buildLimits(parsed), credits: buildCredits(parsed))
+    }
+
+    /// Extract extra-usage ("credits") spend. Prefers the newer `spend` block;
+    /// falls back to the legacy `extra_usage` block. Returns nil when neither
+    /// carries a spend figure.
+    static func buildCredits(_ response: UsageResponse) -> CreditsStatus? {
+        if let spend = response.spend, let used = spend.used {
+            let cap = spend.limit ?? spend.cap?.money
+            return CreditsStatus(
+                usedMinor: used.amountMinor,
+                limitMinor: cap?.amountMinor,
+                currency: used.currency ?? response.extraUsage?.currency ?? "USD",
+                exponent: used.exponent ?? response.extraUsage?.decimalPlaces ?? 2,
+                percent: spend.percent,
+                enabled: spend.enabled ?? true
+            )
+        }
+        if let extra = response.extraUsage, let used = extra.usedCredits {
+            return CreditsStatus(
+                usedMinor: Int(used.rounded()),
+                limitMinor: extra.monthlyLimit.map { Int($0.rounded()) },
+                currency: extra.currency ?? "USD",
+                exponent: extra.decimalPlaces ?? 2,
+                percent: extra.utilization,
+                enabled: extra.isEnabled ?? true
+            )
+        }
+        return nil
     }
 
     /// Prefer the server-computed `limits` array (it carries the model-scoped

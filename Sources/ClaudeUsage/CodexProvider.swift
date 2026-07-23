@@ -217,7 +217,7 @@ struct CodexProvider: UsageProvider {
         }
     }
 
-    func fetchLimits(accessToken: String, accountID: String) async throws -> [LimitStatus] {
+    func fetchUsage(accessToken: String, accountID: String) async throws -> UsageSnapshot {
         var lastError: Error = UsageError.http(0, "No usage URL configured")
         let urlCount = CodexConfig.usageURLs.count
         let startIndex = CodexConfig.preferredUsageURLIndex
@@ -249,7 +249,7 @@ struct CodexProvider: UsageProvider {
             }
             CodexConfig.preferredUsageURLIndex = index
             let parsed = try JSONDecoder().decode(CodexUsageResponse.self, from: data)
-            return Self.buildLimits(parsed)
+            return UsageSnapshot(limits: Self.buildLimits(parsed), credits: nil)
         }
         throw lastError
     }

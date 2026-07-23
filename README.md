@@ -11,7 +11,7 @@ subscriptions — multiple accounts side by side:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-    <img alt="The Claude Usage panel showing three accounts (Claude Work, Claude Personal, and Codex) with per-limit usage bars and reset times" src="docs/screenshot-light.png" width="436">
+    <img alt="The Claude Usage panel showing three accounts (Claude Work, Claude Personal, and Codex) with per-limit usage bars, reset times, and extra-usage credit bars" src="docs/screenshot-light.png" width="436">
   </picture>
 </p>
 
@@ -46,7 +46,9 @@ retried automatically. The ⟳ button forces a refresh of everything.
 
 The menu bar shows one number per account: that account's most-used limit
 (e.g. `21·35%`). The dropdown shows every limit with a progress bar and reset
-time.
+time. Claude accounts with extra usage enabled also get a **Credits** bar
+showing spend against your monthly cap (or just the amount spent, when no cap
+is set).
 
 ## Install (prebuilt app)
 
@@ -95,9 +97,10 @@ the "Open Anyway" step.
 ## Build & run from source
 
 ```sh
-make run       # builds, bundles build/Claude Usage.app, and opens it
-make release   # universal (arm64 + x86_64) zip in build/
-make notarize  # release + Apple notarization (needs Developer ID, see above)
+make run          # builds, bundles build/Claude Usage.app, and opens it
+make release      # universal (arm64 + x86_64) zip in build/
+make notarize     # release + Apple notarization (needs Developer ID, see above)
+make screenshots  # regenerate docs/screenshot-{light,dark}.png from mock data
 ```
 
 Or step by step: `make build` (swift build), `make bundle` (assemble + ad-hoc
