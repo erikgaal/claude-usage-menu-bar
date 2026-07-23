@@ -1,23 +1,7 @@
 import SwiftUI
 
-/// When true, interactive controls render as static look-alikes so the panel
-/// can be rasterized offscreen by `ImageRenderer` for the README screenshots
-/// (live AppKit buttons/toggles don't survive offscreen rendering). Always
-/// false in the running app.
-private struct ScreenshotModeKey: EnvironmentKey {
-    static let defaultValue = false
-}
-
-extension EnvironmentValues {
-    var screenshotMode: Bool {
-        get { self[ScreenshotModeKey.self] }
-        set { self[ScreenshotModeKey.self] = newValue }
-    }
-}
-
 struct MenuContentView: View {
     @ObservedObject var store: AccountStore
-    @Environment(\.screenshotMode) private var screenshotMode
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -67,17 +51,13 @@ struct MenuContentView: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            if screenshotMode {
+            Button {
+                store.refreshNow()
+            } label: {
                 Image(systemName: "arrow.clockwise")
-            } else {
-                Button {
-                    store.refreshNow()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh now")
             }
+            .buttonStyle(.borderless)
+            .help("Refresh now")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -122,20 +102,16 @@ struct MenuContentView: View {
     private var addButtons: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(ProviderID.allCases, id: \.self) { providerID in
-                let label = Label(
-                    "Add \(providerID.displayName) account", systemImage: "plus.app")
-                if screenshotMode {
-                    label.foregroundStyle(.primary)
-                } else {
-                    Button {
-                        store.beginAddAccount(provider: providerID)
-                    } label: {
-                        label
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.primary)
-                    .disabled(store.isAddingAccount)
+                Button {
+                    store.beginAddAccount(provider: providerID)
+                } label: {
+                    Label(
+                        "Add \(providerID.displayName) account",
+                        systemImage: "plus.app")
                 }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.primary)
+                .disabled(store.isAddingAccount)
             }
         }
         .padding(.horizontal, 14)
@@ -147,28 +123,18 @@ struct MenuContentView: View {
             HStack {
                 Text("Launch at login")
                 Spacer()
-                if screenshotMode {
-                    Image(systemName: "checkmark.square.fill")
-                        .foregroundStyle(Color(nsColor: .controlAccentColor))
-                } else {
-                    Toggle("", isOn: launchAtLoginBinding)
-                        .labelsHidden()
-                        .toggleStyle(.checkbox)
-                }
+                Toggle("", isOn: launchAtLoginBinding)
+                    .labelsHidden()
+                    .toggleStyle(.checkbox)
             }
             HStack {
                 Spacer()
-                if screenshotMode {
-                    Text("Quit")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Button("Quit") {
-                        NSApplication.shared.terminate(nil)
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .keyboardShortcut("q")
+                Button("Quit") {
+                    NSApplication.shared.terminate(nil)
                 }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .keyboardShortcut("q")
             }
         }
         .padding(.horizontal, 14)
