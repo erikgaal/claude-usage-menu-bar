@@ -1,7 +1,7 @@
 APP_NAME = Claude Usage
 BUILD_DIR = build
 APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
-VERSION = 1.0.0
+VERSION = 1.1.0
 RELEASE_ZIP = $(BUILD_DIR)/Claude-Usage-$(VERSION).zip
 
 # Sign with a real identity when available so the app keeps the same code
