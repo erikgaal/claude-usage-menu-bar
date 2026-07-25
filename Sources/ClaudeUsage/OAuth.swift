@@ -86,12 +86,46 @@ enum OAuthClient {
     }
 
     static func refresh(refreshToken: String) async throws -> LoginResult {
-        let response = try await postToken(body: [
+        let response = try await postToken(refreshRequest(refreshToken: refreshToken))
+        return makeResult(from: response, previousRefreshToken: refreshToken)
+    }
+
+    // MARK: - Request building (internal so tests can inspect without network)
+
+    static func authorizeURL(challenge: String, state: String) -> URL {
+        var components = URLComponents(string: OAuthConfig.authorizeURL)!
+        components.queryItems = [
+            URLQueryItem(name: "client_id", value: OAuthConfig.clientID),
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "redirect_uri", value: OAuthConfig.redirectURI),
+            URLQueryItem(name: "scope", value: OAuthConfig.scopes.joined(separator: " ")),
+            URLQueryItem(name: "code_challenge", value: challenge),
+            URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "state", value: state),
+        ]
+        return components.url!
+    }
+
+    /// The authorization-code exchange request `login()` sends.
+    static func exchangeRequest(code: String, state: String, verifier: String) throws -> URLRequest
+    {
+        try tokenRequest(body: [
+            "grant_type": "authorization_code",
+            "code": code,
+            "state": state,
+            "redirect_uri": OAuthConfig.redirectURI,
+            "client_id": OAuthConfig.clientID,
+            "code_verifier": verifier,
+        ])
+    }
+
+    /// The refresh request `refresh(refreshToken:)` sends.
+    static func refreshRequest(refreshToken: String) throws -> URLRequest {
+        try tokenRequest(body: [
             "grant_type": "refresh_token",
             "refresh_token": refreshToken,
             "client_id": OAuthConfig.clientID,
         ])
-        return makeResult(from: response, previousRefreshToken: refreshToken)
     }
 
     // MARK: - Internals
@@ -112,39 +146,21 @@ enum OAuthClient {
         )
     }
 
-    private static func authorizeURL(challenge: String, state: String) -> URL {
-        var components = URLComponents(string: OAuthConfig.authorizeURL)!
-        components.queryItems = [
-            URLQueryItem(name: "client_id", value: OAuthConfig.clientID),
-            URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "redirect_uri", value: OAuthConfig.redirectURI),
-            URLQueryItem(name: "scope", value: OAuthConfig.scopes.joined(separator: " ")),
-            URLQueryItem(name: "code_challenge", value: challenge),
-            URLQueryItem(name: "code_challenge_method", value: "S256"),
-            URLQueryItem(name: "state", value: state),
-        ]
-        return components.url!
+    private static func tokenRequest(body: [String: String]) throws -> URLRequest {
+        var request = URLRequest(url: URL(string: OAuthConfig.tokenURL)!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        return request
     }
 
     private static func exchangeCode(
         code: String, state: String, verifier: String
     ) async throws -> TokenResponse {
-        try await postToken(body: [
-            "grant_type": "authorization_code",
-            "code": code,
-            "state": state,
-            "redirect_uri": OAuthConfig.redirectURI,
-            "client_id": OAuthConfig.clientID,
-            "code_verifier": verifier,
-        ])
+        try await postToken(exchangeRequest(code: code, state: state, verifier: verifier))
     }
 
-    private static func postToken(body: [String: String]) async throws -> TokenResponse {
-        var request = URLRequest(url: URL(string: OAuthConfig.tokenURL)!)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(body)
-
+    private static func postToken(_ request: URLRequest) async throws -> TokenResponse {
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else {
