@@ -11,6 +11,9 @@ final class AccountStore: ObservableObject {
     @Published var addAccountError: String?
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
 
+    /// Local-notification manager; `refresh` feeds it old/new state diffs.
+    let notifier = UsageNotifier()
+
     private let defaultsKey = "accounts"
     /// Background poll cadence. The panel also refreshes on open when stale.
     private let pollInterval: TimeInterval = 300
@@ -219,6 +222,7 @@ final class AccountStore: ObservableObject {
         } catch {
             state.error = error.localizedDescription
         }
+        notifier.accountDidUpdate(account, old: states[account.id], new: state)
         states[account.id] = state
     }
 
