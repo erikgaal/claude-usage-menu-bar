@@ -291,7 +291,7 @@ struct AccountSection: View {
                         LimitRow(limit: limit)
                     }
                     if let resetsAt = group.resetsAt {
-                        Text(Self.resetText(resetsAt, rowCount: group.rows.count))
+                        Text(captionText(for: group, resetsAt: resetsAt))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .padding(.leading, LimitRow.labelWidth + LimitRow.spacing)
@@ -300,6 +300,59 @@ struct AccountSection: View {
             }
         }
     }
+
+    // MARK: Pace projection
+
+    /// The reset countdown, extended with a burn-rate projection when one is
+    /// worth surfacing — most of the time this is just the plain reset line,
+    /// because silence beats a noisy forecast.
+    private func captionText(for group: ResetGroup, resetsAt: Date) -> String {
+        let reset = Self.resetText(resetsAt, rowCount: group.rows.count)
+        guard let pace = paceText(for: group, resetsAt: resetsAt) else { return reset }
+        return "\(reset) · \(pace)"
+    }
+
+    /// The projection worth showing for a reset group, if any: the limit that
+    /// runs out soonest — and only when it lands *before* the window resets on
+    /// its own, since running out after the reset is a non-event.
+    private func paceText(for group: ResetGroup, resetsAt: Date) -> String? {
+        var soonest: (limit: LimitStatus, at: Date)?
+        for limit in group.rows {
+            // Low-utilization slopes extrapolate to noise; don't project them.
+            guard limit.percent >= 25,
+                let projected = UsageHistoryStore.shared.projectedExhaustion(
+                    accountID: account.id, limitID: limit.id),
+                projected < resetsAt
+            else { continue }
+            if soonest == nil || projected < soonest!.at {
+                soonest = (limit, projected)
+            }
+        }
+        guard let soonest else { return nil }
+        // With several bars sharing the line, name the one that runs out.
+        let prefix = group.rows.count > 1 ? "\(soonest.limit.name) " : ""
+        return "\(prefix)on pace to run out \(Self.exhaustionTimeText(soonest.at))"
+    }
+
+    /// "14:00" when the projection lands today, "Thu 14:00" otherwise —
+    /// enough precision for a heads-up without pretending it's exact.
+    static func exhaustionTimeText(_ date: Date) -> String {
+        let formatter = Calendar.current.isDateInToday(date)
+            ? Self.timeFormatter : Self.weekdayTimeFormatter
+        return formatter.string(from: date)
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("jm")
+        return formatter
+    }()
+
+    private static let weekdayTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.setLocalizedDateFormatFromTemplate("EEEjm")
+        return formatter
+    }()
 
     static func resetText(_ date: Date, rowCount: Int) -> String {
         let prefix: String

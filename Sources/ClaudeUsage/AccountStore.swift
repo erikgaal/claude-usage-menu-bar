@@ -101,6 +101,7 @@ final class AccountStore: ObservableObject {
         tokenVault[account.id] = nil
         persistVault()
         Keychain.delete(account: account.id)  // legacy per-account item, if any
+        UsageHistoryStore.shared.removeHistory(accountID: account.id)
         persistAccounts()
     }
 
@@ -195,6 +196,7 @@ final class AccountStore: ObservableObject {
             state.limits = snapshot.limits
             state.credits = snapshot.credits
             state.lastUpdated = Date()
+            UsageHistoryStore.shared.record(snapshot.limits, accountID: account.id)
             state.error = nil
             state.needsReauth = false
             cooldownUntil[account.id] = nil
