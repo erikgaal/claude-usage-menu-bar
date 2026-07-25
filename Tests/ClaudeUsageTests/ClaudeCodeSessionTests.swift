@@ -182,15 +182,43 @@ final class ClaudeCodeSessionTests: XCTestCase {
 
     func testPayloadFromEmptyExtrasStillProducesUsableBlock() {
         // Switching to an account never seen signed in: no captured profile.
+        let tokens = makeTokens()
         let rebuilt = ClaudeCodeSession.payload(
-            base: [:], extras: ClaudeCodeSession.synthesizedExtras(),
-            tokens: makeTokens(), unit: .milliseconds)
+            base: [:], extras: ClaudeCodeSession.synthesizedExtras(for: tokens),
+            tokens: tokens, unit: .milliseconds)
         let oauth = oauthBlock(of: rebuilt)
         XCTAssertEqual(oauth["accessToken"] as? String, "new-access")
-        // Scopes must be the ones our tokens were actually minted with, and
+        // Scopes must be the ones this token was actually minted with, and
         // must include the scope Claude Code checks before inferencing.
         XCTAssertEqual(oauth["scopes"] as? [String], OAuthConfig.scopes)
         XCTAssertTrue((oauth["scopes"] as? [String] ?? []).contains("user:inference"))
+    }
+
+    func testSynthesizedExtrasReportTheTokensOwnScopesNotTheCurrentConstant() {
+        // A token minted before the scope list grew keeps the narrower grant
+        // for life. Advertising `OAuthConfig.scopes` for it would tell Claude
+        // Code the session can do things the token isn't authorized for.
+        let legacy = StoredTokens(
+            accessToken: "a", refreshToken: "r", expiresAt: Self.expiry,
+            scopes: ["org:create_api_key", "user:profile", "user:inference"])
+        let extras = ClaudeCodeSession.synthesizedExtras(for: legacy)
+
+        XCTAssertEqual(extras["scopes"] as? [String], legacy.scopes)
+        XCTAssertFalse(
+            (extras["scopes"] as? [String] ?? []).contains("user:sessions:claude_code"),
+            "a scope the token never had must not be claimed on its behalf")
+    }
+
+    func testCurrentScopesCoverTheFeaturesClaudeCodeExpects() {
+        // Claude Code's own login requests these; a switched-in account whose
+        // token lacks one silently loses that feature — `user:sessions:claude_code`
+        // is what /rc (remote-control) needs.
+        for scope in [
+            "org:create_api_key", "user:profile", "user:inference",
+            "user:sessions:claude_code", "user:mcp_servers", "user:file_upload",
+        ] {
+            XCTAssertTrue(OAuthConfig.scopes.contains(scope), "missing \(scope)")
+        }
     }
 
     // MARK: Expiry units

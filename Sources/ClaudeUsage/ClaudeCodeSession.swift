@@ -154,13 +154,16 @@ enum ClaudeCodeSession {
         return payload
     }
 
-    /// Extras for an account we've never captured from Claude Code. The scopes
-    /// are the ones our own tokens were actually minted with, so this is
-    /// accurate by construction rather than a guess. `subscriptionType` is
+    /// Extras for an account we've never captured from Claude Code.
+    ///
+    /// The scopes come from the token being handed over, not from
+    /// `OAuthConfig.scopes`: a token minted before that list grew carries the
+    /// narrower set for life, and advertising the current constant would tell
+    /// Claude Code it has capabilities it doesn't. `subscriptionType` is
     /// deliberately omitted — Claude Code refetches the profile and fills in
     /// what it needs, and inventing a wrong value is worse than absence.
-    static func synthesizedExtras() -> [String: Any] {
-        ["scopes": OAuthConfig.scopes]
+    static func synthesizedExtras(for tokens: StoredTokens) -> [String: Any] {
+        ["scopes": tokens.scopes ?? OAuthConfig.scopes]
     }
 
     // MARK: - Config file (pure)
@@ -459,7 +462,7 @@ extension ClaudeCodeStore {
             let restored =
                 extras
                 .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                ?? ClaudeCodeSession.synthesizedExtras()
+                ?? ClaudeCodeSession.synthesizedExtras(for: tokens)
 
             // `base` is the item as we just read it, so any credential beside
             // this account's OAuth block stays exactly as Claude Code left it.

@@ -11,7 +11,30 @@ enum OAuthConfig {
     static let tokenURL = "https://platform.claude.com/v1/oauth/token"
     static let callbackPort: UInt16 = 54545
     static var redirectURI: String { "http://localhost:\(callbackPort)/callback" }
-    static let scopes = ["org:create_api_key", "user:profile", "user:inference"]
+
+    /// Exactly what `claude auth login` asks for, and it has to stay exactly
+    /// that while the app can hand its tokens to Claude Code.
+    ///
+    /// A token carries the scopes it was minted with, permanently — a refresh
+    /// never widens them. So a token minted with a narrower set doesn't just
+    /// limit this app; handed over by a Claude Code switch, it silently
+    /// downgrades the CLI. Requesting only the first three left
+    /// `user:sessions:claude_code` off, and `/rc` (remote-control, "control
+    /// this session from your phone or claude.ai/code") stopped working for
+    /// any account switched in this way.
+    ///
+    /// Mirrors the binary's own list, which is the dedup of
+    /// `[org:create_api_key, user:profile]` with `[user:profile,
+    /// user:inference, user:sessions:claude_code, user:mcp_servers,
+    /// user:file_upload]`.
+    static let scopes = [
+        "org:create_api_key",
+        "user:profile",
+        "user:inference",
+        "user:sessions:claude_code",
+        "user:mcp_servers",
+        "user:file_upload",
+    ]
 }
 
 enum OAuthError: LocalizedError {
@@ -85,9 +108,13 @@ enum OAuthClient {
         return makeResult(from: response, previousRefreshToken: nil)
     }
 
-    static func refresh(refreshToken: String) async throws -> LoginResult {
+    static func refresh(
+        refreshToken: String, previousScopes: [String]? = nil
+    ) async throws -> LoginResult {
         let response = try await postToken(refreshRequest(refreshToken: refreshToken))
-        return makeResult(from: response, previousRefreshToken: refreshToken)
+        return makeResult(
+            from: response, previousRefreshToken: refreshToken,
+            previousScopes: previousScopes)
     }
 
     // MARK: - Request building (internal so tests can inspect without network)
@@ -131,12 +158,19 @@ enum OAuthClient {
     // MARK: - Internals
 
     private static func makeResult(
-        from response: TokenResponse, previousRefreshToken: String?
+        from response: TokenResponse, previousRefreshToken: String?,
+        previousScopes: [String]? = nil
     ) -> LoginResult {
         let tokens = StoredTokens(
             accessToken: response.accessToken,
             refreshToken: response.refreshToken ?? previousRefreshToken ?? "",
-            expiresAt: Date().addingTimeInterval(response.expiresIn ?? 3600)
+            expiresAt: Date().addingTimeInterval(response.expiresIn ?? 3600),
+            // A refresh returns the grant the token already had; it never
+            // widens it. When the server doesn't restate the scopes, the
+            // previous ones are the truth — falling back to the current
+            // constant would claim scopes this chain was never granted.
+            scopes: response.scope.map { _ in response.grantedScopes }
+                ?? previousScopes ?? response.grantedScopes
         )
         return LoginResult(
             accountID: response.account?.uuid ?? UUID().uuidString,

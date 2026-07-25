@@ -45,7 +45,9 @@ struct ClaudeProvider: UsageProvider {
     }
 
     func refresh(tokens: StoredTokens) async throws -> StoredTokens {
-        try await OAuthClient.refresh(refreshToken: tokens.refreshToken).tokens
+        try await OAuthClient.refresh(
+            refreshToken: tokens.refreshToken, previousScopes: tokens.scopes
+        ).tokens
     }
 
     func fetchUsage(accessToken: String, accountID: String) async throws -> UsageSnapshot {

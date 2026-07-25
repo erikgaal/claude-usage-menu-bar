@@ -258,6 +258,13 @@ struct AccountSection: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Rename…") { startRenaming() }
+            // Also reachable when nothing is visibly wrong: a token keeps the
+            // scopes it was minted with, so an account added before the scope
+            // list grew works fine here yet hands Claude Code a session that
+            // quietly can't do everything. Signing in again is the only fix,
+            // and it keeps the label and usage history.
+            Button("Sign In Again…") { store.reauthenticate(account) }
+                .disabled(store.isAddingAccount)
             if store.managesClaudeCodeSignIn && account.provider == .claude {
                 Divider()
                 Button("Use for Claude Code") {
