@@ -65,7 +65,7 @@ final class AccountStore: ObservableObject {
     // MARK: - Best-account hint
 
     /// Winner-vs-runner-up margin, in percentage points of session usage,
-    /// required before the "Best bet" badge shows. Near-ties give no useful
+    /// required before the "Best" badge shows. Near-ties give no useful
     /// advice, and a badge that hops between accounts on every poll would
     /// train the user to ignore it.
     private static let bestAccountMargin = 10.0

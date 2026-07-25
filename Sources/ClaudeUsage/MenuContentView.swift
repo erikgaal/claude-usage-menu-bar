@@ -239,7 +239,7 @@ struct AccountSection: View {
                 .truncationMode(.middle)
             Spacer(minLength: 0)
             if store.bestAccountIDs.contains(account.id) {
-                BestBetBadge()
+                BestBadge()
             }
         }
     }
@@ -332,9 +332,9 @@ struct AccountSection: View {
 /// Quiet "use this one" capsule for the same-provider account with the most
 /// session headroom (see `AccountStore.bestAccountIDs`). Styled as a hint,
 /// not an alarm: small type, soft tint, no icon.
-struct BestBetBadge: View {
+struct BestBadge: View {
     var body: some View {
-        Text("Best bet")
+        Text("Best")
             .font(.caption2.weight(.semibold))
             .foregroundStyle(.green)
             .padding(.horizontal, 6)
