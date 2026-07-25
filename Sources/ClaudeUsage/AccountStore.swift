@@ -65,6 +65,16 @@ final class AccountStore: ObservableObject {
         accounts.compactMap { states[$0.id]?.lastUpdated }.max()
     }
 
+    // MARK: - Best-account hint
+
+    /// Accounts to badge as the current "best bet" — the same-provider
+    /// account with the most session headroom. The ranking itself lives in
+    /// `BestAccount` (a pure function) so it can be unit-tested without
+    /// spinning up a store.
+    var bestAccountIDs: Set<String> {
+        BestAccount.winners(accounts: accounts, states: states)
+    }
+
     // MARK: - Account management
 
     func beginAddAccount(provider providerID: ProviderID) {
