@@ -115,7 +115,8 @@ final class AccountStore: ObservableObject {
     var bestBadges: [String: BestAccount.Badge] {
         BestAccount.winners(
             accounts: accounts, states: states,
-            sessionProjections: sessionProjections, now: Date())
+            sessionProjections: sessionProjections,
+            sessionBurnRates: sessionBurnRates, now: Date())
     }
 
     /// The full evaluation behind the badge for one provider's account
@@ -125,7 +126,8 @@ final class AccountStore: ObservableObject {
     func bestAccountTrace(for provider: ProviderID) -> BestAccount.GroupTrace? {
         BestAccount.evaluate(
             accounts: accounts, states: states,
-            sessionProjections: sessionProjections, now: Date()
+            sessionProjections: sessionProjections,
+            sessionBurnRates: sessionBurnRates, now: Date()
         ).first { $0.provider == provider }
     }
 
@@ -143,6 +145,22 @@ final class AccountStore: ObservableObject {
             projections[account.id] = projected
         }
         return projections
+    }
+
+    /// Session burn rate per account id (%/hour), from recorded history.
+    /// Accounts with no fittable history (idle, thin, mock mode) are simply
+    /// absent — `BestAccount` treats missing rates as zero demand.
+    private var sessionBurnRates: [String: Double] {
+        var rates: [String: Double] = [:]
+        for account in accounts {
+            guard let limits = states[account.id]?.limits,
+                let session = BestAccount.sessionLimit(in: limits),
+                let rate = history.burnRate(
+                    accountID: account.id, limitID: session.id)
+            else { continue }
+            rates[account.id] = rate
+        }
+        return rates
     }
 
     // MARK: - Account management

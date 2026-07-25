@@ -58,14 +58,26 @@ struct BestAccountDebugView: View {
             Text(statusText(candidate))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            // Expiring-capacity input (issue #19), shown whenever the group
+            // has a demand signal at all — including 0, which explains why
+            // an account was passed over.
+            if trace.aggregatePace > 0, let atRisk = candidate.atRiskCapacity {
+                Text("≈\(Int(atRisk.rounded()))% at risk before reset")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
     private func isBadged(_ candidate: BestAccount.CandidateTrace) -> Bool {
-        if case .badged(let award) = trace.decision {
+        switch trace.decision {
+        case .badged(let award):
             return award.badgedID == candidate.accountID
+        case .expiringFirst(let award):
+            return award.badgedID == candidate.accountID
+        case .groupTooSmall, .allVetoed, .marginTooClose:
+            return false
         }
-        return false
     }
 
     /// Veto reason when out of the running, pace signal otherwise — the
@@ -105,13 +117,13 @@ struct BestAccountDebugView: View {
         case .allVetoed:
             return ["No badge: every account is vetoed."]
         case .marginTooClose(let winnerID, let runnerUpID, let gap):
-            return [
+            return prefixLines + [
                 "Headroom: \(label(winnerID)) leads \(label(runnerUpID)) by "
                     + "\(points(gap)) — needs ≥ \(points(BestAccount.margin)).",
                 "No badge: too close to call.",
             ]
         case .badged(let award):
-            var lines: [String] = []
+            var lines = prefixLines
             if let gap = award.headroomGap {
                 lines.append(
                     "Headroom: \(label(award.headroomWinnerID)) leads by "
@@ -123,7 +135,48 @@ struct BestAccountDebugView: View {
             lines.append(paceLine(award))
             lines.append("Best: \(label(award.badgedID)).")
             return lines
+        case .expiringFirst(let award):
+            var lines = [groupPaceLine]
+            var expiring =
+                "Expiring-first: \(label(award.badgedID)) has \(points(award.atRisk)) "
+                + "at risk (floor ≥ \(points(BestAccount.atRiskFloor)))"
+            if let gap = award.atRiskGap {
+                expiring += ", leads by \(points(gap)) "
+                    + "(needs ≥ \(points(BestAccount.atRiskMargin)))."
+            } else {
+                expiring += "."
+            }
+            lines.append(expiring)
+            lines.append("Best: \(label(award.badgedID)) — use it before its reset.")
+            return lines
         }
+    }
+
+    /// The expiring-capacity preamble for a v2-decided group: the demand
+    /// signal and why the expiring-first path stood down.
+    private var prefixLines: [String] {
+        var lines = [groupPaceLine]
+        switch trace.capacityFallback {
+        case .noAggregatePace:
+            lines.append("Expiring-first: no burn-rate data — using headroom ranking.")
+        case .belowFloor(let topAtRisk):
+            lines.append(
+                "Expiring-first: at most \(points(topAtRisk)) at risk "
+                    + "(floor ≥ \(points(BestAccount.atRiskFloor))) — using headroom ranking.")
+        case .atRiskTooClose(let leaderID, let runnerUpID, let gap):
+            lines.append(
+                "Expiring-first: \(label(leaderID)) leads \(label(runnerUpID)) by only "
+                    + "\(points(gap)) at risk (needs ≥ \(points(BestAccount.atRiskMargin))) "
+                    + "— using headroom ranking.")
+        case nil:
+            break
+        }
+        return lines
+    }
+
+    private var groupPaceLine: String {
+        guard trace.aggregatePace > 0 else { return "Group pace: no data." }
+        return "Group pace: \(String(format: "%.1f", trace.aggregatePace))%/h combined."
     }
 
     private func paceLine(_ award: BestAccount.Award) -> String {

@@ -468,6 +468,12 @@ struct BestBadge: View {
     }
 
     private var tooltip: String {
+        // Expiring-first (v3): explain what is about to vanish and when.
+        if let expiring = badge.expiring {
+            let untilReset = AccountSection.durationText(until: expiring.resetsAt)
+            return "≈\(Int(expiring.points.rounded()))% expires at reset in "
+                + "\(untilReset) — use this first"
+        }
         guard let projected = badge.projectedExhaustion else {
             return "Most session headroom right now"
         }

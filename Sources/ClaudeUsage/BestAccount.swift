@@ -1,11 +1,12 @@
 import Foundation
 
-/// Pure ranking logic behind the "Best" badge (issue #4). Free of
-/// `AccountStore` so it can be unit-tested against handcrafted fixtures —
-/// the store's init touches UserDefaults/Keychain and starts the poll loop,
-/// which tests must never do. Pace data arrives the same way: the store
-/// queries its history store and passes plain projections in, so no history
-/// reads happen here.
+/// Pure ranking logic behind the "Best" badge (issue #4, expiring-capacity
+/// v3 from issue #19). Free of `AccountStore` so it can be unit-tested
+/// against handcrafted fixtures — the store's init touches
+/// UserDefaults/Keychain and starts the poll loop, which tests must never
+/// do. Pace data arrives the same way: the store queries its history store
+/// and passes plain projections and burn rates in, so no history reads
+/// happen here.
 ///
 /// The whole evaluation is captured as data (`evaluate`, one `GroupTrace`
 /// per provider); `winners` is derived from those traces, so the debug
@@ -27,10 +28,24 @@ enum BestAccount {
     /// poll, so small differences must not move the badge. Inclusive, like
     /// `margin`.
     static let overrideMargin: TimeInterval = 30 * 60
+    /// The expiring-first path (issue #19) only acts when at least this much
+    /// capacity, in percentage points of a session window, is at risk of
+    /// expiring unused. Below it nothing meaningful is at stake and the v2
+    /// headroom ranking gives better advice.
+    static let atRiskFloor = 5.0
+    /// Anti-flap margin for the expiring-first path, in percentage points of
+    /// at-risk capacity: the leader must beat the runner-up by at least this
+    /// much or the verdict falls back to v2. At-risk numbers wobble with
+    /// every poll (pace refits, the reset clock ticks down), and near-ties
+    /// mean the strategies are equivalent anyway. Inclusive, like `margin`.
+    static let atRiskMargin = 5.0
 
     // MARK: - Badge
 
-    /// What the badge needs to know beyond the winner's identity.
+    /// What the badge needs to know beyond the winner's identity. At most
+    /// one of the payloads is set: `expiring` for an expiring-first (v3)
+    /// badge, `projectedExhaustion` for a pace-aware (v2) one; both nil
+    /// keeps the static v1 tooltip.
     struct Badge: Equatable {
         /// When the badged account's session is projected to run out — drives
         /// the "≈2h 10m of session left" tooltip. Nil (keep the static v1
@@ -38,6 +53,22 @@ enum BestAccount {
         /// stale one already in the past, or one landing after the session
         /// resets anyway.
         let projectedExhaustion: Date?
+        /// The expiring-first payload: how much capacity is about to vanish
+        /// and when — drives the "≈32% expires at reset in 1h 10m" tooltip.
+        let expiring: ExpiringCapacity?
+
+        init(projectedExhaustion: Date? = nil, expiring: ExpiringCapacity? = nil) {
+            self.projectedExhaustion = projectedExhaustion
+            self.expiring = expiring
+        }
+    }
+
+    /// Capacity about to vanish at a session reset (issue #19).
+    struct ExpiringCapacity: Equatable {
+        /// Percentage points that expire unused unless burned first.
+        let points: Double
+        /// When the session window resets.
+        let resetsAt: Date
     }
 
     // MARK: - Trace model
@@ -78,8 +109,18 @@ enum BestAccount {
         let label: String
         let sessionName: String?
         let sessionPercent: Double?
+        /// When the session window resets, straight from the limit.
+        let sessionResetsAt: Date?
+        /// Raw session burn rate from history (%/hour); nil when unknown.
+        let burnRate: Double?
         let eligibility: Eligibility
         let pace: PaceSignal
+        /// Capacity (percentage points) that expires unused at this
+        /// account's session reset unless the user burns it first — see
+        /// `atRiskCapacity(headroom:resetsAt:aggregatePace:coverage:now:)`.
+        /// Nil for vetoed candidates: they don't take part in the
+        /// expiring-first ranking.
+        var atRiskCapacity: Double?
     }
 
     /// How the pace-override leg compared the headroom winner to its
@@ -101,7 +142,8 @@ enum BestAccount {
         case delta(TimeInterval)
     }
 
-    /// A badge was awarded: how headroom and pace each contributed.
+    /// A badge was awarded on the v2 path: how headroom and pace each
+    /// contributed.
     struct Award: Equatable {
         /// The v1 verdict: most session headroom among eligible accounts.
         let headroomWinnerID: String
@@ -118,6 +160,32 @@ enum BestAccount {
         var overrideApplied: Bool { badgedID != headroomWinnerID }
     }
 
+    /// A badge was awarded on the expiring-first path (issue #19).
+    struct ExpiringAward: Equatable {
+        let badgedID: String
+        /// The badged account's at-risk capacity, in percentage points.
+        let atRisk: Double
+        /// Lead over the runner-up's at-risk capacity; nil when the badged
+        /// account is the sole eligible candidate (unreachable today — a
+        /// sole account has zero at-risk, see `atRiskCapacity` — but kept
+        /// honest rather than force-unwrapped).
+        let atRiskGap: Double?
+        /// Tooltip payload for the badged account.
+        let badge: Badge
+    }
+
+    /// Why the expiring-first path stood down and left the verdict to v2.
+    enum CapacityFallback: Equatable {
+        /// No burn-rate history anywhere in the group: no demand signal.
+        case noAggregatePace
+        /// The largest at-risk capacity is under `atRiskFloor`: nothing
+        /// meaningful is at stake (idle day, aligned resets, ample time).
+        case belowFloor(topAtRisk: Double)
+        /// The top two at-risk values are within `atRiskMargin` of each
+        /// other: the strategies tie, so the steadier v2 verdict applies.
+        case atRiskTooClose(leaderID: String, runnerUpID: String, gap: Double)
+    }
+
     /// A provider group's verdict.
     enum Decision: Equatable {
         /// Fewer than two accounts of this provider: "best" is meaningless
@@ -125,10 +193,13 @@ enum BestAccount {
         case groupTooSmall
         /// Two or more accounts, but none survived the vetoes.
         case allVetoed
-        /// The winner-vs-runner-up gap is under `margin`: too close to call,
-        /// stay quiet rather than flap.
+        /// v2 fallback: the winner-vs-runner-up gap is under `margin` — too
+        /// close to call, stay quiet rather than flap.
         case marginTooClose(winnerID: String, runnerUpID: String, gap: Double)
+        /// v2 fallback: headroom ranking (with the pace override) decided.
         case badged(Award)
+        /// v3: burn the expiring window first (issue #19).
+        case expiringFirst(ExpiringAward)
     }
 
     /// Everything the badge logic saw and decided for one provider.
@@ -136,6 +207,14 @@ enum BestAccount {
         let provider: ProviderID
         /// All of the provider's accounts, in panel order.
         let candidates: [CandidateTrace]
+        /// Sum of the group's session burn rates (%/hour, negatives clamped
+        /// to zero): the total demand that could be redirected between the
+        /// group's accounts. Zero means no history signal anywhere.
+        let aggregatePace: Double
+        /// Set when the group got as far as ranking but the expiring-first
+        /// path stood down; nil when it decided (or when the group never
+        /// ranked at all — too small / all vetoed).
+        let capacityFallback: CapacityFallback?
         let decision: Decision
     }
 
@@ -143,15 +222,18 @@ enum BestAccount {
 
     /// Full evaluation, one trace per provider (in panel order). Per
     /// provider — comparing across providers is meaningless, a Claude
-    /// session % and a Codex session % aren't interchangeable — the eligible
-    /// account with the most 5-hour-session headroom wins, subject to the
-    /// vetoes and the anti-flapping margin; the pace override may then move
-    /// the badge to a runner-up projected to outlast the winner by at least
-    /// `overrideMargin`.
+    /// session % and a Codex session % aren't interchangeable — the primary
+    /// objective is maximizing total daily capacity: badge the account whose
+    /// session capacity would otherwise expire unused (issue #19). When no
+    /// meaningful capacity is at risk, the v2 behavior applies wholesale:
+    /// most 5-hour-session headroom wins, subject to the vetoes and the
+    /// anti-flapping margin, with the pace override possibly moving the
+    /// badge to a runner-up projected to outlast the winner.
     static func evaluate(
         accounts: [AccountMeta],
         states: [String: AccountDisplayState],
         sessionProjections: [String: Date] = [:],
+        sessionBurnRates: [String: Double] = [:],
         now: Date = Date()
     ) -> [GroupTrace] {
         // Group by provider, preserving panel order for groups and members.
@@ -164,15 +246,28 @@ enum BestAccount {
 
         return order.map { provider in
             let members = groups[provider] ?? []
-            let candidates = members.map { account in
+            // Demand is demand no matter which account currently absorbs it
+            // (even a vetoed account's traffic gets redirected somewhere
+            // usable), so every member's rate counts. Negative slopes are
+            // regression jitter on flat usage, clamped to zero.
+            let aggregatePace = members.reduce(0.0) {
+                $0 + max(0, sessionBurnRates[$1.id] ?? 0)
+            }
+            var candidates = members.map { account in
                 candidateTrace(
                     account: account, state: states[account.id],
-                    projection: sessionProjections[account.id], now: now)
+                    projection: sessionProjections[account.id],
+                    burnRate: sessionBurnRates[account.id], now: now)
             }
+            attachAtRisk(to: &candidates, aggregatePace: aggregatePace, now: now)
+            let (decision, fallback) = decision(
+                for: candidates, groupSize: members.count, aggregatePace: aggregatePace)
             return GroupTrace(
                 provider: provider,
                 candidates: candidates,
-                decision: decision(for: candidates, groupSize: members.count))
+                aggregatePace: aggregatePace,
+                capacityFallback: fallback,
+                decision: decision)
         }
     }
 
@@ -183,14 +278,21 @@ enum BestAccount {
         accounts: [AccountMeta],
         states: [String: AccountDisplayState],
         sessionProjections: [String: Date] = [:],
+        sessionBurnRates: [String: Double] = [:],
         now: Date = Date()
     ) -> [String: Badge] {
         var result: [String: Badge] = [:]
         for trace in evaluate(
             accounts: accounts, states: states,
-            sessionProjections: sessionProjections, now: now) {
-            if case .badged(let award) = trace.decision {
+            sessionProjections: sessionProjections,
+            sessionBurnRates: sessionBurnRates, now: now) {
+            switch trace.decision {
+            case .badged(let award):
                 result[award.badgedID] = award.badge
+            case .expiringFirst(let award):
+                result[award.badgedID] = award.badge
+            case .groupTooSmall, .allVetoed, .marginTooClose:
+                break
             }
         }
         return result
@@ -202,11 +304,13 @@ enum BestAccount {
     /// Veto precedence matches v1's guards: reauth, then missing data, then
     /// the weekly-exhaustion check. The pace signal is computed even for
     /// vetoed accounts — the decision ignores it, but the debug view shows
-    /// it.
+    /// it. At-risk capacity is attached afterwards: it needs the whole
+    /// group's aggregate pace and eligible headroom.
     private static func candidateTrace(
         account: AccountMeta,
         state: AccountDisplayState?,
         projection: Date?,
+        burnRate: Double?,
         now: Date
     ) -> CandidateTrace {
         let session = state.flatMap { sessionLimit(in: $0.limits) }
@@ -234,24 +338,119 @@ enum BestAccount {
             label: account.displayLabel,
             sessionName: session?.name,
             sessionPercent: session?.percent,
+            sessionResetsAt: session?.resetsAt,
+            burnRate: burnRate,
             eligibility: eligibility,
-            pace: pace)
+            pace: pace,
+            atRiskCapacity: nil)
     }
 
-    /// The group verdict over already-traced candidates.
+    /// Computes each eligible candidate's at-risk capacity in place. The
+    /// coverage term is the *other* eligible accounts' combined session
+    /// headroom — the capacity that could absorb the group's demand instead.
+    private static func attachAtRisk(
+        to candidates: inout [CandidateTrace], aggregatePace: Double, now: Date
+    ) {
+        let eligible: [(index: Int, headroom: Double)] = candidates.indices.compactMap {
+            index in
+            guard candidates[index].eligibility == .eligible,
+                let percent = candidates[index].sessionPercent
+            else { return nil }
+            return (index, max(0, 100 - percent))
+        }
+        let totalHeadroom = eligible.reduce(0.0) { $0 + $1.headroom }
+        for (index, headroom) in eligible {
+            candidates[index].atRiskCapacity = atRiskCapacity(
+                headroom: headroom,
+                resetsAt: candidates[index].sessionResetsAt,
+                aggregatePace: aggregatePace,
+                coverage: totalHeadroom - headroom,
+                now: now)
+        }
+    }
+
+    /// Capacity that will vanish unused at this account's session reset
+    /// unless the user burns this account first (issue #19).
+    ///
+    /// Of the group's demand before the reset (`aggregatePace × hours`),
+    /// this account can absorb at most its own headroom — that much is
+    /// savable by prioritizing it: `savable = min(headroom, demand)`, the
+    /// formula from issue #19. But demand the *other* eligible accounts
+    /// cannot absorb (`demand − coverage`) lands on this account no matter
+    /// what the user does, so it was never at risk of expiring:
+    /// `at-risk = savable − inevitable`. Without the subtraction the raw
+    /// formula grows with time-to-reset and ranks the account the issue's
+    /// own worked example calls the reserve *above* the expiring one.
+    ///
+    /// Consequences worth knowing: a sole eligible account always scores 0
+    /// (all demand lands on it anyway — nothing is redirectable), and other
+    /// windows' refreshes are deliberately not modelled (they only add
+    /// coverage, so at-risk is slightly overestimated, erring toward showing
+    /// the hint). An idle or already-reset window (nil/past `resetsAt`) has
+    /// nothing expiring: 0.
+    private static func atRiskCapacity(
+        headroom: Double, resetsAt: Date?, aggregatePace: Double,
+        coverage: Double, now: Date
+    ) -> Double {
+        guard let resetsAt, resetsAt > now, aggregatePace > 0 else { return 0 }
+        let demand = aggregatePace * resetsAt.timeIntervalSince(now) / 3600
+        let savable = min(headroom, demand)
+        let inevitable = min(headroom, max(0, demand - coverage))
+        return savable - inevitable
+    }
+
+    /// The group verdict over already-traced candidates: the expiring-first
+    /// path (v3) when it has a confident signal, the v2 ranking wholesale
+    /// otherwise — with the fallback reason preserved for the debug view.
     private static func decision(
-        for candidates: [CandidateTrace], groupSize: Int
-    ) -> Decision {
-        guard groupSize >= 2 else { return .groupTooSmall }
+        for candidates: [CandidateTrace], groupSize: Int, aggregatePace: Double
+    ) -> (Decision, CapacityFallback?) {
+        guard groupSize >= 2 else { return (.groupTooSmall, nil) }
 
         // Eligible candidates, best (lowest session percent) first. Vetoed
-        // accounts dropped out here, so the pace override below can never
-        // resurrect them.
+        // accounts dropped out here, so neither path can resurrect them.
         let ranked = candidates
             .filter { $0.eligibility == .eligible }
             .sorted { ($0.sessionPercent ?? 100) < ($1.sessionPercent ?? 100) }
-        guard let winner = ranked.first else { return .allVetoed }
+        guard let winner = ranked.first else { return (.allVetoed, nil) }
 
+        // v3: burn expiring windows first (issue #19). Gated hard — a
+        // confident "this will vanish" beats headroom, anything less falls
+        // back to v2 wholesale.
+        let fallback: CapacityFallback
+        if aggregatePace <= 0 {
+            fallback = .noAggregatePace
+        } else {
+            // Largest at-risk first; ties keep the headroom order.
+            let byRisk = ranked.sorted {
+                ($0.atRiskCapacity ?? 0) > ($1.atRiskCapacity ?? 0)
+            }
+            let leader = byRisk[0]
+            let leaderRisk = leader.atRiskCapacity ?? 0
+            let runnerUpRisk = byRisk.count >= 2 ? (byRisk[1].atRiskCapacity ?? 0) : nil
+            if leaderRisk < atRiskFloor {
+                fallback = .belowFloor(topAtRisk: leaderRisk)
+            } else if let runnerUpRisk, leaderRisk - runnerUpRisk < atRiskMargin {
+                fallback = .atRiskTooClose(
+                    leaderID: leader.accountID,
+                    runnerUpID: byRisk[1].accountID,
+                    gap: leaderRisk - runnerUpRisk)
+            } else if let resetsAt = leader.sessionResetsAt {
+                let award = ExpiringAward(
+                    badgedID: leader.accountID,
+                    atRisk: leaderRisk,
+                    atRiskGap: runnerUpRisk.map { leaderRisk - $0 },
+                    badge: Badge(
+                        expiring: ExpiringCapacity(
+                            points: leaderRisk, resetsAt: resetsAt)))
+                return (.expiringFirst(award), nil)
+            } else {
+                // Unreachable: positive at-risk implies a live future reset.
+                fallback = .belowFloor(topAtRisk: leaderRisk)
+            }
+        }
+
+        // v2 wholesale (unchanged): headroom ranking plus the pace override.
         let runnerUp = ranked.count >= 2 ? ranked[1] : nil
         let gap = runnerUp.flatMap { candidate -> Double? in
             guard let winnerPercent = winner.sessionPercent,
@@ -261,8 +460,11 @@ enum BestAccount {
         }
         if let runnerUp, let gap, gap < margin {
             // Too close to call — stay quiet rather than flap.
-            return .marginTooClose(
-                winnerID: winner.accountID, runnerUpID: runnerUp.accountID, gap: gap)
+            return (
+                .marginTooClose(
+                    winnerID: winner.accountID, runnerUpID: runnerUp.accountID, gap: gap),
+                fallback
+            )
         }
 
         // Pace override: only the headroom winner and its runner-up are
@@ -281,13 +483,16 @@ enum BestAccount {
             }
         }()
 
-        return .badged(
-            Award(
-                headroomWinnerID: winner.accountID,
-                headroomGap: gap,
-                paceComparison: comparison,
-                badgedID: badged.accountID,
-                badge: badge(for: badged)))
+        return (
+            .badged(
+                Award(
+                    headroomWinnerID: winner.accountID,
+                    headroomGap: gap,
+                    paceComparison: comparison,
+                    badgedID: badged.accountID,
+                    badge: badge(for: badged))),
+            fallback
+        )
     }
 
     /// A candidate's pace signal from its raw projection.
@@ -318,7 +523,7 @@ enum BestAccount {
         }
     }
 
-    /// The tooltip payload for the badged account: real dates only — the
+    /// The v2 tooltip payload for the badged account: real dates only — the
     /// "outlasts the window" case has no honest duration to show.
     private static func badge(for candidate: CandidateTrace) -> Badge {
         if case .projected(let date) = candidate.pace {
