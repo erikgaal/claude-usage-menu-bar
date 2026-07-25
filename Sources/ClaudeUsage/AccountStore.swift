@@ -11,6 +11,9 @@ final class AccountStore: ObservableObject {
     @Published var addAccountError: String?
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
 
+    /// Local-notification manager; `refresh` feeds it old/new state diffs.
+    let notifier = UsageNotifier()
+
     private let defaultsKey = "accounts"
     /// Background poll cadence. The panel also refreshes on open when stale.
     private let pollInterval: TimeInterval = 300
@@ -91,6 +94,18 @@ final class AccountStore: ObservableObject {
         guard let index = accounts.firstIndex(where: { $0.id == account.id }) else { return }
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         accounts[index].label = trimmed.isEmpty ? nil : trimmed
+        persistAccounts()
+    }
+
+    /// Moves an account up (negative offset) or down (positive) in the list.
+    /// Array order is the single source of truth — it drives the panel, the
+    /// menu bar summary, and the persisted JSON — so this is the whole change.
+    func moveAccount(_ account: AccountMeta, by offset: Int) {
+        guard let index = accounts.firstIndex(where: { $0.id == account.id }) else { return }
+        let destination = index + offset
+        guard accounts.indices.contains(destination), destination != index else { return }
+        let moved = accounts.remove(at: index)
+        accounts.insert(moved, at: destination)
         persistAccounts()
     }
 
@@ -209,6 +224,7 @@ final class AccountStore: ObservableObject {
         } catch {
             state.error = error.localizedDescription
         }
+        notifier.accountDidUpdate(account, old: states[account.id], new: state)
         states[account.id] = state
     }
 

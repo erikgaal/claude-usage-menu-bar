@@ -127,6 +127,7 @@ struct MenuContentView: View {
                     .labelsHidden()
                     .toggleStyle(.checkbox)
             }
+            NotificationsToggleRow(notifier: store.notifier)
             HStack {
                 Spacer()
                 Button("Quit") {
@@ -146,6 +147,27 @@ struct MenuContentView: View {
             get: { store.launchAtLogin },
             set: { store.setLaunchAtLogin($0) }
         )
+    }
+}
+
+/// Own view observing the notifier directly — AccountStore doesn't republish
+/// its nested ObservableObject, so binding through `store` would leave the
+/// checkbox stale. Toggling drives authorization/cancellation via the
+/// notifier's own didSet.
+private struct NotificationsToggleRow: View {
+    @ObservedObject var notifier: UsageNotifier
+
+    var body: some View {
+        HStack {
+            Text("Enable notifications")
+            Spacer()
+            Toggle("", isOn: $notifier.isEnabled)
+                .labelsHidden()
+                .toggleStyle(.checkbox)
+        }
+        .help(
+            "Alerts when a limit passes \(Int(UsageNotifier.thresholdPercent))%, "
+                + "when it resets, and when sign-in expires")
     }
 }
 
@@ -204,6 +226,14 @@ struct AccountSection: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Rename…") { startRenaming() }
+            Divider()
+            // Order matters beyond the panel: it also sets the menu bar
+            // summary order, so surface reordering right where accounts live.
+            Button("Move Up") { store.moveAccount(account, by: -1) }
+                .disabled(store.accounts.first?.id == account.id)
+            Button("Move Down") { store.moveAccount(account, by: 1) }
+                .disabled(store.accounts.last?.id == account.id)
+            Divider()
             Button("Remove Account", role: .destructive) {
                 store.removeAccount(account)
             }
