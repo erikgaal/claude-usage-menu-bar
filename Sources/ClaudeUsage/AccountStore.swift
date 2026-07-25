@@ -106,12 +106,32 @@ final class AccountStore: ObservableObject {
 
     // MARK: - Best-account hint
 
-    /// Accounts to badge as the current "best bet" — the same-provider
-    /// account with the most session headroom. The ranking itself lives in
-    /// `BestAccount` (a pure function) so it can be unit-tested without
-    /// spinning up a store.
-    var bestAccountIDs: Set<String> {
-        BestAccount.winners(accounts: accounts, states: states)
+    /// Accounts to badge as the current "best bet", keyed by account id —
+    /// the same-provider account with the most session headroom, pace-aware
+    /// via each account's projected session exhaustion. The ranking itself
+    /// lives in `BestAccount` (a pure function) so it can be unit-tested
+    /// without spinning up a store; this property's whole contribution is
+    /// asking the history store for the projections.
+    var bestBadges: [String: BestAccount.Badge] {
+        BestAccount.winners(
+            accounts: accounts, states: states,
+            sessionProjections: sessionProjections, now: Date())
+    }
+
+    /// Projected session-window exhaustion per account id, from recorded
+    /// burn-rate history. Accounts with no projectable pace (idle, thin
+    /// history, mock mode) are simply absent.
+    private var sessionProjections: [String: Date] {
+        var projections: [String: Date] = [:]
+        for account in accounts {
+            guard let limits = states[account.id]?.limits,
+                let session = BestAccount.sessionLimit(in: limits),
+                let projected = history.projectedExhaustion(
+                    accountID: account.id, limitID: session.id)
+            else { continue }
+            projections[account.id] = projected
+        }
+        return projections
     }
 
     // MARK: - Account management

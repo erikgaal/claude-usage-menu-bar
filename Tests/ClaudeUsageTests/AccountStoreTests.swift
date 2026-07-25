@@ -200,6 +200,43 @@ final class AccountStoreTests: XCTestCase {
             credits: credits)
     }
 
+    /// A single "Session" window at `percent`, shaped like the providers
+    /// build it, so `BestAccount` and the history store treat it as the
+    /// session slot.
+    private func makeSessionSnapshot(percent: Double) -> UsageSnapshot {
+        UsageSnapshot(
+            limits: [
+                LimitStatus(
+                    id: "session|", name: "Session", percent: percent,
+                    resetsAt: nil, isActive: true, sortOrder: 0)
+            ],
+            credits: nil)
+    }
+
+    /// Seeds a synthetic session-limit ramp into the harness's history
+    /// directory: 12 samples five minutes apart, climbing at `ratePerHour`
+    /// and ending at `endPercent` right about now. Written through a second
+    /// `UsageHistoryStore` over the same directory, which the store's own
+    /// history store picks up from disk on first read.
+    private func seedSessionRamp(
+        directory: URL, account: String, endPercent: Double, ratePerHour: Double
+    ) {
+        let store = UsageHistoryStore(directory: directory)
+        let now = Date()
+        let interval: TimeInterval = 300
+        let count = 12
+        for index in 0..<count {
+            let stepsBack = Double(count - 1 - index)
+            let limit = LimitStatus(
+                id: "session|", name: "Session",
+                percent: endPercent - ratePerHour * stepsBack * interval / 3600,
+                resetsAt: nil, isActive: true, sortOrder: 0)
+            store.record(
+                [limit], accountID: account,
+                at: now.addingTimeInterval(-stepsBack * interval))
+        }
+    }
+
     private func makeLogin(
         id: String = "acct-1", email: String = "user@example.com",
         tokens: StoredTokens? = nil
@@ -664,6 +701,42 @@ final class AccountStoreTests: XCTestCase {
         await harness.store.refresh(account: account, force: false)
 
         XCTAssertEqual(harness.store.menuBarText, "!%")
+    }
+
+    // MARK: Best-account hint wiring
+
+    func testBestBadgesArePaceAwareEndToEnd() async throws {
+        // Two Claude accounts: acct-1 has more headroom (40% vs 55%) but its
+        // synthetic ramp burns 30%/h (≈2 h of runway); acct-2 burns 3%/h
+        // (≈15 h). The store must compute projections from its injected
+        // history store and hand the badge — and the tooltip date — to the
+        // slower burner, even though v1 headroom favours acct-1.
+        let fast = makeAccount(id: "acct-1")
+        let slow = makeAccount(id: "acct-2", email: "other@example.com")
+        let provider = ProviderFake()
+        provider.setFetchResult(
+            .success(makeSessionSnapshot(percent: 40)), forAccount: fast.id)
+        provider.setFetchResult(
+            .success(makeSessionSnapshot(percent: 55)), forAccount: slow.id)
+        let harness = makeHarness(
+            provider: provider, accounts: [fast, slow],
+            vault: [fast.id: makeTokens(), slow.id: makeTokens()])
+        seedSessionRamp(
+            directory: harness.historyDirectory, account: fast.id,
+            endPercent: 40, ratePerHour: 30)
+        seedSessionRamp(
+            directory: harness.historyDirectory, account: slow.id,
+            endPercent: 55, ratePerHour: 3)
+
+        await harness.store.refresh(account: fast, force: false)
+        await harness.store.refresh(account: slow, force: false)
+
+        let badges = harness.store.bestBadges
+        XCTAssertEqual(Set(badges.keys), [slow.id])
+        // (100 − 55) / 3%/h = 15 h out; generous slack for slow CI runs.
+        let projected = try XCTUnwrap(badges[slow.id]?.projectedExhaustion)
+        let expected = Date().addingTimeInterval(15 * 3600)
+        XCTAssertEqual(projected.timeIntervalSince(expected), 0, accuracy: 900)
     }
 
     // MARK: Notifier wiring

@@ -281,8 +281,8 @@ struct AccountSection: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 0)
-            if store.bestAccountIDs.contains(account.id) {
-                BestBadge()
+            if let badge = store.bestBadges[account.id] {
+                BestBadge(badge: badge)
             }
         }
     }
@@ -434,9 +434,13 @@ struct AccountSection: View {
 // MARK: - Building blocks
 
 /// Quiet "use this one" capsule for the same-provider account with the most
-/// session headroom (see `AccountStore.bestAccountIDs`). Styled as a hint,
-/// not an alarm: small type, soft tint, no icon.
+/// session headroom (see `AccountStore.bestBadges`). Styled as a hint, not an
+/// alarm: small type, soft tint, no icon. When the ranking has a pace
+/// projection for the badged account the tooltip becomes time-based;
+/// otherwise it keeps the static v1 text.
 struct BestBadge: View {
+    let badge: BestAccount.Badge
+
     var body: some View {
         Text("Best")
             .font(.caption2.weight(.semibold))
@@ -444,7 +448,15 @@ struct BestBadge: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(Capsule().fill(Color.green.opacity(0.15)))
-            .help("Most session headroom right now")
+            .help(tooltip)
+    }
+
+    private var tooltip: String {
+        guard let projected = badge.projectedExhaustion else {
+            return "Most session headroom right now"
+        }
+        let left = AccountSection.durationText(until: projected)
+        return "≈\(left) of session left at current pace"
     }
 }
 

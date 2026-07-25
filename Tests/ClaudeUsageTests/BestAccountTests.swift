@@ -8,9 +8,13 @@ import XCTest
 @MainActor
 final class BestAccountTests: XCTestCase {
 
-    /// Fixed reset time (2033-05-18T03:33:20Z). The ranking never reads it,
-    /// but realistic fixtures keep the tests honest about the shape of data.
+    /// Fixed reset time (2033-05-18T03:33:20Z). The v1 ranking never read
+    /// it; the v2 pace override does — a projection landing at/after it
+    /// counts as outlasting the window.
     private static let resetDate = Date(timeIntervalSince1970: 2_000_000_000)
+    /// Fixed "now", four hours before the session resets — a realistic spot
+    /// inside a 5-hour window — so projections relative to both are stable.
+    private static let now = resetDate.addingTimeInterval(-4 * 3600)
 
     // MARK: Fixtures
 
@@ -52,12 +56,25 @@ final class BestAccountTests: XCTestCase {
 
     /// Runs the ranking over (account, state) pairs; a nil state models an
     /// account the store hasn't heard from at all.
-    private func winners(_ pairs: [(AccountMeta, AccountDisplayState?)]) -> Set<String> {
+    private func winners(
+        _ pairs: [(AccountMeta, AccountDisplayState?)],
+        projections: [String: Date] = [:]
+    ) -> Set<String> {
+        Set(badges(pairs, projections: projections).keys)
+    }
+
+    /// Same run, but keeping the full verdicts for tooltip assertions.
+    private func badges(
+        _ pairs: [(AccountMeta, AccountDisplayState?)],
+        projections: [String: Date] = [:]
+    ) -> [String: BestAccount.Badge] {
         var states: [String: AccountDisplayState] = [:]
         for (account, state) in pairs {
             states[account.id] = state
         }
-        return BestAccount.winners(accounts: pairs.map(\.0), states: states)
+        return BestAccount.winners(
+            accounts: pairs.map(\.0), states: states,
+            sessionProjections: projections, now: Self.now)
     }
 
     // MARK: Group size
@@ -278,5 +295,221 @@ final class BestAccountTests: XCTestCase {
             (makeAccount("codex-b", provider: .codex), makeState(session: 99)),
         ])
         XCTAssertEqual(result, ["codex-a"])
+    }
+
+    // MARK: Pace override (v2)
+
+    /// A projection `interval` seconds after the fixed "now".
+    private func projection(_ interval: TimeInterval) -> Date {
+        Self.now.addingTimeInterval(interval)
+    }
+
+    func testRunnerUpOutlastingWinnerTakesBadge() {
+        // a has the most headroom, but at its pace it dies in 30 minutes
+        // while b lasts two hours — the badge follows the longer-lasting
+        // account, and the tooltip carries b's projection.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(1800), "b": projection(2 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["b"])
+        XCTAssertEqual(result["b"]?.projectedExhaustion, projection(2 * 3600))
+    }
+
+    func testWinnerKeepsBadgeAndTooltipWhenPaceAgrees() {
+        // The headroom winner also lasts longer: no override, and its own
+        // projection feeds the tooltip.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(3 * 3600), "b": projection(3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertEqual(result["a"]?.projectedExhaustion, projection(3 * 3600))
+    }
+
+    func testOverrideAtExactMarginMoves() {
+        // b outlasts a by exactly 30 minutes — the override margin is
+        // inclusive, like the v1 headroom margin.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(3600), "b": projection(3600 + 1800)])
+        XCTAssertEqual(Set(result.keys), ["b"])
+    }
+
+    func testJustUnderOverrideMarginStaysWithHeadroomWinner() {
+        // 29m59s of extra runway is forecast noise, not a reason to move.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(3600), "b": projection(3600 + 1799)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertEqual(result["a"]?.projectedExhaustion, projection(3600))
+    }
+
+    func testWinnerWithoutProjectionKeepsBadge() {
+        // a is idle (no projection) while b is projected five hours out. Nil
+        // means "not currently burning" — no pace signal — never "exhausts
+        // immediately"; reading it that way would hand b the badge here.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["b": projection(5 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    func testRunnerUpWithoutProjectionKeepsV1Winner() {
+        // a is dying fast, but idle b offers no pace signal to compare
+        // against — the headroom verdict stands, tooltip still time-based.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(1800)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertEqual(result["a"]?.projectedExhaustion, projection(1800))
+    }
+
+    func testNoProjectionsIsPureV1() {
+        let result = badges([
+            (makeAccount("a"), makeState(session: 40)),
+            (makeAccount("b"), makeState(session: 55)),
+        ])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    func testOverrideNeverResurrectsVetoedAccount() {
+        // b would outlast everyone, but its sign-in is dead — vetoed accounts
+        // drop out before the pace comparison. The eligible runner-up c has
+        // no projection, so a keeps the badge.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55, needsReauth: true)),
+                (makeAccount("c"), makeState(session: 70)),
+            ],
+            projections: ["a": projection(1800), "b": projection(6 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+    }
+
+    func testOverrideRespectsWeeklyVeto() {
+        // Same shape with the weekly-exhaustion veto: b's long runway is a
+        // mirage when its week is spent.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55, weekly: 99.5)),
+                (makeAccount("c"), makeState(session: 70)),
+            ],
+            projections: ["a": projection(1800), "b": projection(6 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+    }
+
+    func testOverrideDoesNotCrossProviders() {
+        // Codex's loser has by far the longest runway, but each provider's
+        // override weighs only its own candidates: the Claude runner-up is
+        // 20 minutes of extra runway short of an override, while the Codex
+        // pair does flip on pace.
+        let result = winners(
+            [
+                (makeAccount("claude-a"), makeState(session: 20)),
+                (makeAccount("claude-b"), makeState(session: 70)),
+                (makeAccount("codex-c", provider: .codex), makeState(session: 10)),
+                (makeAccount("codex-d", provider: .codex), makeState(session: 90)),
+            ],
+            projections: [
+                "claude-a": projection(1800),
+                "claude-b": projection(1800 + 600),
+                "codex-c": projection(3600),
+                "codex-d": projection(3 * 3600),
+            ])
+        XCTAssertEqual(result, ["claude-a", "codex-d"])
+    }
+
+    func testSingleAccountWithProjectionStillNotBadged() {
+        // The group-size rule survives v2: pace data doesn't make a lone
+        // account comparable to nothing.
+        let result = badges(
+            [(makeAccount("a"), makeState(session: 5))],
+            projections: ["a": projection(3600)])
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    func testPastProjectionIsNoSignal() {
+        // a's projection is 10 minutes ago: stale history, not "already
+        // dead" — a truly exhausted session shows in its percent, which the
+        // ranking already sees. With no usable signal on a the override
+        // can't fire, and the tooltip stays static.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(-600), "b": projection(2 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    func testProjectionBeyondResetCountsAsOutlastingTheWindow() {
+        // b's projected exhaustion lands after its session resets — at the
+        // current pace it never runs out this window, which beats a's
+        // 30-minute runway. There's no honest duration to show for "outlasts
+        // the window", so the tooltip stays static.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: [
+                "a": projection(1800),
+                "b": Self.resetDate.addingTimeInterval(3600),
+            ])
+        XCTAssertEqual(Set(result.keys), ["b"])
+        XCTAssertNil(result["b"]?.projectedExhaustion)
+    }
+
+    func testWinnerProjectionBeyondResetKeepsBadgeWithStaticTooltip() {
+        // The winner outlasts its whole window; the runner-up dying sooner is
+        // no reason to move, and the post-reset date is not shown.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: [
+                "a": Self.resetDate.addingTimeInterval(3600),
+                "b": projection(1800),
+            ])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    func testBothProjectionsBeyondResetKeepV1Winner() {
+        // Neither account runs out this window: pace has nothing to add, so
+        // the headroom verdict stands with the static tooltip.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: [
+                "a": Self.resetDate.addingTimeInterval(3600),
+                "b": Self.resetDate.addingTimeInterval(2 * 3600),
+            ])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
     }
 }
