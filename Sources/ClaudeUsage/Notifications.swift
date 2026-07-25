@@ -5,6 +5,82 @@ import Foundation
 // its completion handlers run on a background queue by design.
 @preconcurrency import UserNotifications
 
+// MARK: - Scheduling seam
+
+/// The slice of notification-center behavior `UsageNotifier` needs, in plain
+/// values (identifier, title/body, fire date) so tests can substitute a
+/// trivial spy. Tests must never reach the real center: the `swift test`
+/// host *has* a bundle identifier, so the un-bundled guard below wouldn't
+/// protect them, and the real center would prompt from the test runner.
+@MainActor
+protocol NotificationScheduling {
+    /// Ask the system for permission; the OS only prompts the first time.
+    func requestAuthorization()
+    /// Queue a banner. `fireDate` nil → deliver immediately.
+    func add(identifier: String, title: String, body: String, fireDate: Date?)
+    /// Identifiers of scheduled-but-undelivered requests. The completion is
+    /// invoked on the main actor (the real center reports on a background
+    /// queue; the production wrapper hops back).
+    func pendingIdentifiers(completion: @escaping @MainActor ([String]) -> Void)
+    func removePending(identifiers: [String])
+    func removeAllPending()
+}
+
+/// Production scheduler wrapping `UNUserNotificationCenter`.
+@MainActor
+final class SystemNotificationScheduler: NotificationScheduling {
+    /// `UNUserNotificationCenter.current()` traps when the process has no
+    /// bundle identity — the bare `swift build` binary, `swift run`, and the
+    /// screenshot harness — so every access goes through this guard. Mock
+    /// mode also lands here: fake data must never produce real notifications.
+    private var center: UNUserNotificationCenter? {
+        guard Bundle.main.bundleIdentifier != nil else { return nil }
+        #if DEBUG
+            if Mock.isEnabled { return nil }
+        #endif
+        return UNUserNotificationCenter.current()
+    }
+
+    func requestAuthorization() {
+        center?.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    func add(identifier: String, title: String, body: String, fireDate: Date?) {
+        guard let center else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let trigger = fireDate.map {
+            UNTimeIntervalNotificationTrigger(
+                timeInterval: max(1, $0.timeIntervalSinceNow), repeats: false)
+        }
+        center.add(
+            UNNotificationRequest(identifier: identifier, content: content, trigger: trigger))
+    }
+
+    func pendingIdentifiers(completion: @escaping @MainActor ([String]) -> Void) {
+        guard let center else {
+            completion([])
+            return
+        }
+        center.getPendingNotificationRequests { requests in
+            let identifiers = requests.map(\.identifier)
+            Task { @MainActor in completion(identifiers) }
+        }
+    }
+
+    func removePending(identifiers: [String]) {
+        center?.removePendingNotificationRequests(withIdentifiers: identifiers)
+    }
+
+    func removeAllPending() {
+        center?.removeAllPendingNotificationRequests()
+    }
+}
+
+// MARK: - Notifier
+
 /// Local-notification manager: alerts when a limit crosses the usage
 /// threshold, when a hot limit's window resets, and when an account's
 /// sign-in expires.
@@ -20,39 +96,39 @@ final class UsageNotifier: ObservableObject {
 
     private static let defaultsKey = "notificationsEnabled"
 
+    private let scheduler: NotificationScheduling
+    private let defaults: UserDefaults
+
     /// User toggle from the panel footer. Enabling requests system
     /// authorization (the OS only prompts the first time); disabling drops
     /// any scheduled reset alerts so nothing fires while off.
     @Published var isEnabled: Bool {
         didSet {
             guard oldValue != isEnabled else { return }
-            UserDefaults.standard.set(isEnabled, forKey: Self.defaultsKey)
-            guard let center else { return }
+            defaults.set(isEnabled, forKey: Self.defaultsKey)
             if isEnabled {
-                center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+                scheduler.requestAuthorization()
             } else {
-                center.removeAllPendingNotificationRequests()
+                scheduler.removeAllPending()
             }
         }
     }
 
-    init() {
-        // Assigning in init doesn't trip didSet, so restoring the saved value
-        // never re-prompts for authorization at launch.
-        isEnabled = UserDefaults.standard.bool(forKey: Self.defaultsKey)
+    /// Production configuration. A separate overload because a default
+    /// argument of `SystemNotificationScheduler()` would be evaluated in a
+    /// nonisolated context (rejected pre-SE-0411 with tools 5.9).
+    convenience init() {
+        self.init(scheduler: SystemNotificationScheduler(), defaults: .standard)
     }
 
-    /// `UNUserNotificationCenter.current()` traps when the process has no
-    /// bundle identity — the bare `swift build` binary, `swift run`, and the
-    /// screenshot harness — so every notification-center access goes through
-    /// this guard. Mock mode also lands here: fake data must never produce
-    /// real notifications.
-    private var center: UNUserNotificationCenter? {
-        guard Bundle.main.bundleIdentifier != nil else { return nil }
-        #if DEBUG
-            if Mock.isEnabled { return nil }
-        #endif
-        return UNUserNotificationCenter.current()
+    /// Injection point for tests: a spy scheduler (never the real center)
+    /// and an isolated defaults suite.
+    init(scheduler: NotificationScheduling, defaults: UserDefaults) {
+        self.scheduler = scheduler
+        self.defaults = defaults
+        // Assigning in init doesn't trip didSet, so restoring the saved value
+        // never re-prompts for authorization at launch.
+        isEnabled = defaults.bool(forKey: Self.defaultsKey)
     }
 
     // MARK: - Event detection
@@ -62,15 +138,14 @@ final class UsageNotifier: ObservableObject {
     func accountDidUpdate(
         _ account: AccountMeta, old: AccountDisplayState?, new: AccountDisplayState
     ) {
-        guard isEnabled, let center else { return }
+        guard isEnabled else { return }
 
         // Sign-in expired: only on the false→true flip, not on every poll
         // that keeps failing while the account waits for the user.
         if new.needsReauth, old?.needsReauth != true {
             post(
                 title: account.displayLabel,
-                body: "Sign-in expired — open the menu to sign in again.",
-                center: center)
+                body: "Sign-in expired — open the menu to sign in again.")
         }
 
         // Threshold: edge-detect against the previous sample so a limit
@@ -88,11 +163,10 @@ final class UsageNotifier: ObservableObject {
             else { continue }
             post(
                 title: account.displayLabel,
-                body: "\(limit.name) limit at \(Int(limit.percent.rounded()))%",
-                center: center)
+                body: "\(limit.name) limit at \(Int(limit.percent.rounded()))%")
         }
 
-        rescheduleResetAlerts(for: account, limits: new.limits, center: center)
+        rescheduleResetAlerts(for: account, limits: new.limits)
     }
 
     // MARK: - Reset scheduling
@@ -104,9 +178,7 @@ final class UsageNotifier: ObservableObject {
     /// cancels the stale request and schedules the new time instead of
     /// stacking a second alert. Limits that dropped back below the threshold
     /// lose their pending alert the same way.
-    private func rescheduleResetAlerts(
-        for account: AccountMeta, limits: [LimitStatus], center: UNUserNotificationCenter
-    ) {
+    private func rescheduleResetAlerts(for account: AccountMeta, limits: [LimitStatus]) {
         var desired: [String: LimitStatus] = [:]
         for limit in limits {
             guard limit.percent >= Self.thresholdPercent,
@@ -120,31 +192,27 @@ final class UsageNotifier: ObservableObject {
         // per-account refreshes never cancel each other's alerts.
         let accountPrefix = "reset|\(account.id)|"
         let title = account.displayLabel
-        center.getPendingNotificationRequests { pending in
-            let existing = Set(
-                pending.map(\.identifier).filter { $0.hasPrefix(accountPrefix) })
+        let scheduler = self.scheduler
+        scheduler.pendingIdentifiers { pendingIDs in
+            let existing = Set(pendingIDs.filter { $0.hasPrefix(accountPrefix) })
             let stale = existing.subtracting(desired.keys)
             if !stale.isEmpty {
-                center.removePendingNotificationRequests(withIdentifiers: Array(stale))
+                scheduler.removePending(identifiers: Array(stale))
             }
             for (identifier, limit) in desired where !existing.contains(identifier) {
                 guard let resetsAt = limit.resetsAt else { continue }
-                let content = UNMutableNotificationContent()
-                content.title = title
-                content.body = "\(limit.name) limit has reset"
-                content.sound = .default
-                let trigger = UNTimeIntervalNotificationTrigger(
-                    timeInterval: max(1, resetsAt.timeIntervalSinceNow), repeats: false)
-                center.add(
-                    UNNotificationRequest(
-                        identifier: identifier, content: content, trigger: trigger))
+                scheduler.add(
+                    identifier: identifier, title: title,
+                    body: "\(limit.name) limit has reset", fireDate: resetsAt)
             }
         }
     }
 
     /// "reset|account|limit|unixSeconds" — deterministic so rescheduling the
-    /// same window replaces itself, and prefix-matchable per account. Whole
-    /// seconds absorb any sub-second jitter in the server's reset time.
+    /// same window replaces itself, and prefix-matchable per account (account
+    /// ids are UUIDs, so the prefix stays unambiguous even though limit ids
+    /// can themselves contain "|"). Whole seconds absorb any sub-second
+    /// jitter in the server's reset time.
     private static func resetIdentifier(
         account: AccountMeta, limit: LimitStatus, resetsAt: Date
     ) -> String {
@@ -153,15 +221,9 @@ final class UsageNotifier: ObservableObject {
 
     // MARK: - Posting
 
-    /// Fires a banner immediately (nil trigger). Random identifiers: these
+    /// Fires a banner immediately (nil fire date). Random identifiers: these
     /// are one-shot events, unlike reset alerts there is nothing to replace.
-    private func post(title: String, body: String, center: UNUserNotificationCenter) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        center.add(
-            UNNotificationRequest(
-                identifier: UUID().uuidString, content: content, trigger: nil))
+    private func post(title: String, body: String) {
+        scheduler.add(identifier: UUID().uuidString, title: title, body: body, fireDate: nil)
     }
 }
