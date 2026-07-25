@@ -87,38 +87,45 @@ final class ClaudeCodeSessionTests: XCTestCase {
     // MARK: Extracting a profile
 
     func testExtrasDropOnlyTokenFields() {
-        let extras = ClaudeCodeSession.extras(from: makePayload())
-        let oauth = oauthBlock(of: extras)
+        let extras = ClaudeCodeSession.oauthExtras(from: makePayload())
         for key in ClaudeCodeSession.tokenKeys {
-            XCTAssertNil(oauth[key], "\(key) is per-account and must not be kept")
+            XCTAssertNil(extras[key], "\(key) is per-account and must not be kept")
         }
-        XCTAssertEqual(oauth["subscriptionType"] as? String, "max")
-        XCTAssertEqual(oauth["scopes"] as? [String], ["user:inference", "user:profile"])
+        XCTAssertEqual(extras["subscriptionType"] as? String, "max")
+        XCTAssertEqual(extras["scopes"] as? [String], ["user:inference", "user:profile"])
     }
 
-    func testExtrasKeepFieldsWeDoNotModel() {
-        // The whole reason profiles are captured rather than synthesized: we
-        // must carry across fields this app has never heard of.
+    func testExtrasKeepUnknownOAuthFieldsButNotSiblingCredentials() {
+        // Forward compatibility is the whole reason profiles are captured
+        // rather than synthesized, so unknown fields *of this account* have to
+        // survive. Anything beside the OAuth block belongs to the item rather
+        // than to the account: capturing it would restore a stale copy over
+        // whatever is live, and would carry credentials this app doesn't own
+        // into the profile store.
         let payload = makePayload(
             extraOAuthKeys: ["futureFlag": true],
-            topLevel: ["someOtherProvider": ["token": "keep-me"]])
-        let extras = ClaudeCodeSession.extras(from: payload)
-        XCTAssertEqual(oauthBlock(of: extras)["futureFlag"] as? Bool, true)
-        XCTAssertEqual(
-            (extras["someOtherProvider"] as? [String: Any])?["token"] as? String, "keep-me")
+            topLevel: ["someOtherProvider": ["token": "not-ours"]])
+        let extras = ClaudeCodeSession.oauthExtras(from: payload)
+
+        XCTAssertEqual(extras["futureFlag"] as? Bool, true)
+        XCTAssertNil(extras["someOtherProvider"])
+        XCTAssertFalse(
+            "\(extras)".contains("not-ours"),
+            "a credential sitting beside ours must not reach the profile store")
     }
 
-    func testExtrasOfUnrecognizedPayloadPassThrough() {
-        let extras = ClaudeCodeSession.extras(from: ["mystery": 1])
-        XCTAssertEqual(extras["mystery"] as? Int, 1)
+    func testExtrasOfPayloadWithoutAnOAuthBlockAreEmpty() {
+        // A format we don't recognize yields nothing to restore rather than a
+        // wholesale copy of the item.
+        XCTAssertTrue(ClaudeCodeSession.oauthExtras(from: ["mystery": 1]).isEmpty)
     }
 
     // MARK: Rebuilding a payload
 
     func testPayloadWritesTokensInRequestedUnit() {
-        let extras = ClaudeCodeSession.extras(from: makePayload())
+        let extras = ClaudeCodeSession.oauthExtras(from: makePayload())
         let rebuilt = ClaudeCodeSession.payload(
-            extras: extras, tokens: makeTokens(), unit: .milliseconds)
+            base: [:], extras: extras, tokens: makeTokens(), unit: .milliseconds)
         let oauth = oauthBlock(of: rebuilt)
         XCTAssertEqual(oauth["accessToken"] as? String, "new-access")
         XCTAssertEqual(oauth["refreshToken"] as? String, "new-refresh")
@@ -127,8 +134,28 @@ final class ClaudeCodeSessionTests: XCTestCase {
 
     func testPayloadHonoursSecondsUnit() {
         let rebuilt = ClaudeCodeSession.payload(
-            extras: [:], tokens: makeTokens(), unit: .seconds)
+            base: [:], extras: [:], tokens: makeTokens(), unit: .seconds)
         XCTAssertEqual(oauthBlock(of: rebuilt)["expiresAt"] as? Double, 2_000_000_000)
+    }
+
+    func testPayloadTakesSiblingCredentialsFromTheLiveItemNotTheProfile() {
+        // A profile describes one account. Everything else in the item is
+        // whatever Claude Code last wrote, so a switch has to leave it standing
+        // rather than restore this account's stale snapshot over it.
+        let live = makePayload(topLevel: ["someOtherProvider": ["token": "current"]])
+        let profile: [String: Any] = ["subscriptionType": "max", "futureFlag": true]
+
+        let rebuilt = ClaudeCodeSession.payload(
+            base: live, extras: profile, tokens: makeTokens(), unit: .milliseconds)
+
+        XCTAssertEqual(
+            (rebuilt["someOtherProvider"] as? [String: Any])?["token"] as? String, "current")
+        let oauth = oauthBlock(of: rebuilt)
+        XCTAssertEqual(oauth["futureFlag"] as? Bool, true)
+        XCTAssertEqual(oauth["accessToken"] as? String, "new-access")
+        // The incoming account's block replaces the outgoing one outright —
+        // no field of the account being switched away from may survive in it.
+        XCTAssertNil(oauth["scopes"], "the outgoing account's scopes must not linger")
     }
 
     func testRoundTripPreservesEverythingButTokens() {
@@ -138,7 +165,8 @@ final class ClaudeCodeSessionTests: XCTestCase {
             extraOAuthKeys: ["futureFlag": true], topLevel: ["other": "value"])
         let read = ClaudeCodeSession.tokens(from: original)
         let rebuilt = ClaudeCodeSession.payload(
-            extras: ClaudeCodeSession.extras(from: original),
+            base: original,
+            extras: ClaudeCodeSession.oauthExtras(from: original),
             tokens: makeTokens(), unit: read!.unit)
 
         XCTAssertEqual(rebuilt["other"] as? String, "value")
@@ -155,7 +183,7 @@ final class ClaudeCodeSessionTests: XCTestCase {
     func testPayloadFromEmptyExtrasStillProducesUsableBlock() {
         // Switching to an account never seen signed in: no captured profile.
         let rebuilt = ClaudeCodeSession.payload(
-            extras: ClaudeCodeSession.synthesizedExtras(),
+            base: [:], extras: ClaudeCodeSession.synthesizedExtras(),
             tokens: makeTokens(), unit: .milliseconds)
         let oauth = oauthBlock(of: rebuilt)
         XCTAssertEqual(oauth["accessToken"] as? String, "new-access")

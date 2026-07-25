@@ -35,7 +35,7 @@ struct AccountMeta: Codable, Identifiable, Equatable {
 }
 
 /// OAuth token material stored in the Keychain per account.
-struct StoredTokens: Codable, Sendable {
+struct StoredTokens: Codable, Sendable, Equatable {
     var accessToken: String
     var refreshToken: String
     var expiresAt: Date

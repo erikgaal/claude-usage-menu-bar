@@ -18,16 +18,16 @@ enum Keychain {
     /// so unlocking the app costs at most one Keychain prompt.
     static let vaultAccount = "oauth-tokens"
 
-    /// `service` is a parameter rather than a constant because the app also
-    /// reads and writes Claude Code's own item (`Claude Code-credentials`) when
-    /// it manages the CLI's sign-in.
+    /// Only ever writes this app's own items, and takes no `service` so it
+    /// can't be pointed at anyone else's.
     ///
-    /// Updating a foreign item this way is safe: `SecItemUpdate` leaves the
-    /// item's ACL intact (verified against a restricted probe item), and the
-    /// `Encrypt` authorization is granted to every application anyway, so
-    /// writes never prompt. Reads are the operation that costs an
-    /// authorization — see `AccountStore.hasUsableToken`.
-    static func save(_ data: Data, account: String, service: String = Keychain.service) throws {
+    /// Writing a *foreign* item from here is not safe, however harmless it
+    /// looks: a write from a third-party-signed binary resets the item's
+    /// partition list to this app's `teamid:`, and the owner loses its silent
+    /// read. `ClaudeCodeStore.writeCredentials` explains the mechanism and
+    /// drives `/usr/bin/security` instead.
+    static func save(_ data: Data, account: String) throws {
+        let service = Keychain.service
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -44,6 +44,26 @@ enum Keychain {
         guard status == errSecSuccess else { throw KeychainError.status(status) }
     }
 
+    /// Updates an item belonging to another application, and *only* updates:
+    /// there is deliberately no create-on-missing path here, because an item
+    /// this app creates gets an ACL naming only this app, which would lock the
+    /// real owner out of credentials it still writes to — broken in a way that
+    /// looks fine from its side. Missing is the caller's problem to report.
+    static func saveForeign(_ data: Data, account: String, service: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let status = SecItemUpdate(
+            query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        guard status == errSecSuccess else { throw KeychainError.status(status) }
+    }
+
+    /// Reads may target a foreign `service` — Claude Code's item, when the app
+    /// manages the CLI's sign-in. Unlike a write, a read leaves the partition
+    /// list alone; it costs this app one authorization the first time, and
+    /// nothing thereafter.
     static func load(account: String, service: String = Keychain.service) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

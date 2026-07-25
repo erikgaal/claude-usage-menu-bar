@@ -121,27 +121,35 @@ enum ClaudeCodeSession {
         return (stored, unit)
     }
 
-    /// The payload with per-account token material stripped — what we keep as
-    /// an account's profile so a later switch can restore fields we never
-    /// synthesize ourselves.
-    static func extras(from payload: [String: Any]) -> [String: Any] {
-        var stripped = payload
-        if var oauth = stripped[oauthKey] as? [String: Any] {
-            for key in tokenKeys { oauth.removeValue(forKey: key) }
-            stripped[oauthKey] = oauth
-        }
-        return stripped
+    /// An account's `claudeAiOauth` block with the per-account token material
+    /// stripped — what we keep as its profile so a later switch can restore
+    /// fields we never synthesize ourselves.
+    ///
+    /// Scoped to that block on purpose. Anything sitting beside it belongs to
+    /// the Keychain item as a whole rather than to this account, so snapshotting
+    /// it per-account would be wrong twice over: switching back would restore a
+    /// stale copy over whatever is live, and material this app has no business
+    /// holding would ride along into the profile store.
+    static func oauthExtras(from payload: [String: Any]) -> [String: Any] {
+        var oauth = payload[oauthKey] as? [String: Any] ?? [:]
+        for key in tokenKeys { oauth.removeValue(forKey: key) }
+        return oauth
     }
 
-    /// Rebuilds a full payload from a profile's extras plus live tokens.
+    /// The item as it stands, with this account's OAuth block swapped in.
+    ///
+    /// Merging into `base` rather than replacing it is what keeps everything
+    /// else in the item live and current — a profile only ever describes its
+    /// own account, so it is never the authority on the rest of the payload.
     static func payload(
-        extras: [String: Any], tokens: StoredTokens, unit: ExpiresAtUnit
+        base: [String: Any], extras: [String: Any], tokens: StoredTokens,
+        unit: ExpiresAtUnit
     ) -> [String: Any] {
-        var payload = extras
-        var oauth = payload[oauthKey] as? [String: Any] ?? [:]
+        var oauth = extras
         oauth["accessToken"] = tokens.accessToken
         oauth["refreshToken"] = tokens.refreshToken
         oauth["expiresAt"] = unit.raw(from: tokens.expiresAt)
+        var payload = base
         payload[oauthKey] = oauth
         return payload
     }
@@ -152,7 +160,7 @@ enum ClaudeCodeSession {
     /// deliberately omitted — Claude Code refetches the profile and fills in
     /// what it needs, and inventing a wrong value is worse than absence.
     static func synthesizedExtras() -> [String: Any] {
-        [oauthKey: ["scopes": OAuthConfig.scopes]]
+        ["scopes": OAuthConfig.scopes]
     }
 
     // MARK: - Config file (pure)
@@ -279,7 +287,9 @@ enum ClaudeCodeError: LocalizedError {
     case lockUnavailable
     case notSignedIn
     case unrecognizedFormat
-    case noTokens
+    /// Claude Code's token has expired and this poll isn't allowed to refresh
+    /// it, because doing so would prompt the user out of the blue.
+    case staleWithoutRefresh
 
     var errorDescription: String? {
         switch self {
@@ -289,8 +299,8 @@ enum ClaudeCodeError: LocalizedError {
             return "Claude Code isn't signed in yet. Sign in once with `claude`, then retry."
         case .unrecognizedFormat:
             return "Claude Code's credential format has changed; not touching it."
-        case .noTokens:
-            return "No stored tokens for that account — sign in to it first."
+        case .staleWithoutRefresh:
+            return "Waiting for Claude Code to refresh its own sign-in."
         }
     }
 }
@@ -312,21 +322,53 @@ struct ClaudeCodeStore {
         return object
     }
 
-    /// Writing costs no authorization prompt — the item grants `Encrypt` to
-    /// every application — and leaves its ACL untouched. If Claude Code has
-    /// never signed in there is no item and nothing to switch, so `Keychain`'s
-    /// create-on-missing path simply won't trigger here.
+    /// Updates the credential item in place, and costs the user a keychain
+    /// password prompt the next time Claude Code reads it. That cost is known
+    /// and currently unavoidable — see below.
+    ///
+    /// Alongside its trusted-application list, a keychain item carries a
+    /// *partition list* (`apple:`, `apple-tool:`, `teamid:…`). A write from a
+    /// third-party-signed binary resets that list to the writer's own
+    /// `teamid:`, evicting `apple-tool:` — the partition `/usr/bin/security`
+    /// reads under. Claude Code reads its credentials by shelling out to
+    /// `security find-generic-password -w`, so after any write from this app
+    /// the CLI asks for the login keychain password once. "Always Allow"
+    /// clears it until the next switch.
+    ///
+    /// Measured in both directions: the same `SecItemUpdate` from an
+    /// Apple-signed binary leaves the partition list alone (which is why an
+    /// unsigned probe first cleared this path wrongly), and a rewrite through
+    /// `security` restores an evicted one.
+    ///
+    /// Two alternatives were tried and rejected:
+    ///
+    /// - Recreating the item with an explicit `SecAccess`. Fixes nothing — the
+    ///   partition list is separate from the ACL — and discards every other
+    ///   client's accumulated authorization along the way.
+    /// - Driving `security add-generic-password -U -w` and feeding the secret
+    ///   over stdin, so the writer is Apple-signed. The tool's interactive
+    ///   reader is `readpassphrase`, capped at `_PASSWORD_LEN` (128 bytes); a
+    ///   real payload is several KB and was silently truncated mid-token,
+    ///   destroying the sign-in. Passing `-w <value>` has no such limit but
+    ///   puts a live refresh token in the process list, which `security` itself
+    ///   warns against.
     func writeCredentials(_ payload: [String: Any]) throws {
         let data = try JSONSerialization.data(withJSONObject: payload)
-        try Keychain.save(
+        try Keychain.saveForeign(
             data,
             account: ClaudeCodeSession.credentialsAccount,
             service: ClaudeCodeSession.credentialsService)
     }
 
+    /// A missing file is legitimately empty — Claude Code writes it on first
+    /// run — but a failed *read* must not read as empty. Callers merge into
+    /// what this returns and write it back, so answering `[:]` for a file that
+    /// exists but couldn't be read would replace the user's projects, history
+    /// and onboarding state with a single key.
     func readConfig() throws -> [String: Any] {
         let url = ClaudeCodeSession.configFile
-        guard let data = try? Data(contentsOf: url) else { return [:] }
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        let data = try Data(contentsOf: url)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ClaudeCodeError.unrecognizedFormat
         }
@@ -409,18 +451,26 @@ extension ClaudeCodeStore {
     ) async throws -> SwitchResult {
         try await withWriteLock {
             var result = SwitchResult()
-            let currentPayload = try readCredentials()
+
+            // No item means Claude Code has never signed in, and there is no
+            // sign-in to switch. Refusing here is load-bearing: `Keychain.save`
+            // falls back to `SecItemAdd` when there's nothing to update, which
+            // would mint the item under *this* app with a fresh ACL that
+            // doesn't name Claude Code — leaving the CLI prompting to read
+            // credentials it should own outright.
+            guard let currentPayload = try readCredentials() else {
+                throw ClaudeCodeError.notSignedIn
+            }
             let config = try readConfig()
 
-            if let currentPayload,
-                let currentID = ClaudeCodeSession.activeAccountUUID(inConfig: config)
-                    ?? knownCurrentID,
+            if let currentID = ClaudeCodeSession.activeAccountUUID(inConfig: config)
+                ?? knownCurrentID,
                 currentID != accountID
             {
                 result.harvestedAccountID = currentID
                 result.harvestedTokens = ClaudeCodeSession.tokens(from: currentPayload)?.tokens
                 result.harvestedExtras = try? JSONSerialization.data(
-                    withJSONObject: ClaudeCodeSession.extras(from: currentPayload))
+                    withJSONObject: ClaudeCodeSession.oauthExtras(from: currentPayload))
                 if let identity = config["oauthAccount"] as? [String: Any] {
                     result.harvestedIdentity = try? JSONSerialization.data(
                         withJSONObject: identity)
@@ -429,16 +479,17 @@ extension ClaudeCodeStore {
 
             // Match whatever unit this install stores expiries in; default to
             // milliseconds, which is what Claude Code writes.
-            let unit =
-                currentPayload
-                .flatMap { ClaudeCodeSession.tokens(from: $0)?.unit } ?? .milliseconds
+            let unit = ClaudeCodeSession.tokens(from: currentPayload)?.unit ?? .milliseconds
             let restored =
                 extras
                 .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
                 ?? ClaudeCodeSession.synthesizedExtras()
 
+            // `base` is the item as we just read it, so any credential beside
+            // this account's OAuth block stays exactly as Claude Code left it.
             try writeCredentials(
-                ClaudeCodeSession.payload(extras: restored, tokens: tokens, unit: unit))
+                ClaudeCodeSession.payload(
+                    base: currentPayload, extras: restored, tokens: tokens, unit: unit))
 
             if let block = try? JSONSerialization.jsonObject(with: oauthAccount)
                 as? [String: Any]
@@ -457,7 +508,18 @@ extension ClaudeCodeStore {
     /// same chain, and whichever refreshes without coordinating signs the other
     /// out. The common path takes no lock at all, since a valid token only
     /// needs reading.
+    ///
+    /// `allowRefresh` is false on background polls, and that restraint is the
+    /// point. Refreshing means writing the result back here, and a write costs
+    /// Claude Code its silent read (see `writeCredentials`) — so refreshing on
+    /// a timer would put a login-password dialog in front of the user at a
+    /// moment they did nothing to provoke, with no way to connect it to this
+    /// app. Read-only polls give up freshness instead, which costs almost
+    /// nothing: the token only expires while Claude Code is idle, and usage
+    /// doesn't move while it's idle. The moment it runs, it refreshes the chain
+    /// itself and the next poll reads the new token.
     func activeAccessToken(
+        allowRefresh: Bool,
         refresh: @Sendable (StoredTokens) async throws -> StoredTokens
     ) async throws -> StoredTokens {
         if let payload = try readCredentials(),
@@ -466,6 +528,7 @@ extension ClaudeCodeStore {
         {
             return current.tokens
         }
+        guard allowRefresh else { throw ClaudeCodeError.staleWithoutRefresh }
 
         return try await withWriteLock {
             // Re-read inside the lock: a `claude` session may have refreshed
@@ -482,7 +545,7 @@ extension ClaudeCodeStore {
             let refreshed = try await refresh(current.tokens)
             try writeCredentials(
                 ClaudeCodeSession.payload(
-                    extras: ClaudeCodeSession.extras(from: payload),
+                    base: payload, extras: ClaudeCodeSession.oauthExtras(from: payload),
                     tokens: refreshed, unit: current.unit))
             return refreshed
         }

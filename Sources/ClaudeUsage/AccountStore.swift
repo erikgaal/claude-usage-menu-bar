@@ -32,15 +32,24 @@ final class AccountStore: ObservableObject {
     @Published var claudeCodeError: String?
 
     private static let claudeCodeEnabledKey = "managesClaudeCodeSignIn"
-    private static let claudeCodeProfilesKey = "claudeCodeProfiles"
+    /// Profiles live in the Keychain, beside the token vault.
+    private static let claudeCodeProfilesAccount = "claude-code-profiles"
+    /// Earlier builds of this feature kept them in UserDefaults; see
+    /// `loadClaudeCodeProfilesIfNeeded`.
+    private static let legacyClaudeCodeProfilesKey = "claudeCodeProfiles"
 
     /// What we captured from Claude Code the last time an account was the one
     /// signed in, so switching back restores it rather than replacing it with
-    /// the minimum we can synthesize. Token material is stripped out, so this
-    /// holds no secrets and belongs in UserDefaults rather than the Keychain.
+    /// the minimum we can synthesize.
+    ///
+    /// Kept in the Keychain rather than UserDefaults. The known tokens are
+    /// stripped before capture, but `credentialExtras` is deliberately
+    /// forward-compatible — it preserves fields this app has never heard of —
+    /// and "whatever Anthropic adds to a credential payload next" is not a
+    /// safe thing to promise about in a plaintext plist.
     struct ClaudeCodeProfile: Codable {
-        /// Credential payload minus tokens: `subscriptionType`, `scopes`, and
-        /// whatever Anthropic adds that we don't model.
+        /// The account's OAuth block minus tokens: `subscriptionType`,
+        /// `scopes`, and whatever Anthropic adds that we don't model.
         var credentialExtras: Data?
         /// The account's `oauthAccount` record — `seatTier`, billing, org and
         /// rate-limit tiers. We can't derive these, and Claude Code only
@@ -50,7 +59,7 @@ final class AccountStore: ObservableObject {
 
     private let claudeCodeStore = ClaudeCodeStore()
     private var claudeCodeProfiles: [String: ClaudeCodeProfile] = [:]
-    private var claudeCodeSwitchTask: Task<Void, Never>?
+    private var claudeCodeProfilesLoaded = false
 
     private let defaultsKey = "accounts"
     /// Background poll cadence. The panel also refreshes on open when stale.
@@ -76,7 +85,6 @@ final class AccountStore: ObservableObject {
             }
         #endif
         loadAccounts()
-        loadClaudeCodeProfiles()
         refreshClaudeCodeActive()
         startRefreshLoop()
     }
@@ -167,9 +175,13 @@ final class AccountStore: ObservableObject {
         persistVault()
         Keychain.delete(account: account.id)  // legacy per-account item, if any
         UsageHistoryStore.shared.removeHistory(accountID: account.id)
+        loadClaudeCodeProfilesIfNeeded()
         claudeCodeProfiles[account.id] = nil
         persistClaudeCodeProfiles()
-        if claudeCodeActiveID == account.id { claudeCodeActiveID = nil }
+        // Recompute rather than blank it: the account is gone from `accounts`,
+        // so this settles to nil if it was the active one and stays correct if
+        // it wasn't. Claude Code is of course still signed in as it.
+        refreshClaudeCodeActive()
         persistAccounts()
     }
 
@@ -202,28 +214,36 @@ final class AccountStore: ObservableObject {
         state.error = nil
         states[meta.id] = state
         persistAccounts()
+        // Claude Code may already be signed in as the account just added, and
+        // `claudeCodeActiveID` only counts accounts we hold — so this is the
+        // moment that becomes true.
+        refreshClaudeCodeActive()
 
         Task { await self.refresh(account: meta, force: true) }
     }
 
     // MARK: - Claude Code sign-in
 
-    /// Accounts this can switch between: Claude subscriptions we hold tokens
-    /// for. Codex accounts aren't Claude Code sign-ins.
-    var claudeCodeSwitchableAccounts: [AccountMeta] {
-        accounts.filter { $0.provider == .claude }
-    }
-
-    var isSwitchingClaudeCode: Bool { claudeCodeSwitchTask != nil }
+    /// Published rather than derived from a task handle: the context menu's
+    /// disabled state reads this, and a plain stored property gives SwiftUI
+    /// nothing to re-render on when a switch starts or finishes.
+    @Published private(set) var isSwitchingClaudeCode = false
 
     /// Cheap enough to call on every panel open — it reads `~/.claude.json`
     /// and never touches the Keychain.
+    ///
+    /// Filtered to accounts we hold, so this really does mean what its
+    /// declaration says. Claude Code may well be signed in as an account the
+    /// user never added here; that isn't a chain we share, and every consumer
+    /// — the badge, the switch guard, `TokenSource` — wants nil for it.
     func refreshClaudeCodeActive() {
-        guard managesClaudeCodeSignIn else {
+        guard managesClaudeCodeSignIn, let active = claudeCodeStore.currentAccountID(),
+            accounts.contains(where: { $0.id == active })
+        else {
             claudeCodeActiveID = nil
             return
         }
-        claudeCodeActiveID = claudeCodeStore.currentAccountID()
+        claudeCodeActiveID = active
     }
 
     /// Points Claude Code — and the desktop app and IDE extensions, which
@@ -232,13 +252,14 @@ final class AccountStore: ObservableObject {
     /// they don't need restarting.
     func useForClaudeCode(_ account: AccountMeta) {
         guard managesClaudeCodeSignIn, account.provider == .claude,
-            claudeCodeSwitchTask == nil, account.id != claudeCodeActiveID
+            !isSwitchingClaudeCode, account.id != claudeCodeActiveID
         else { return }
 
         claudeCodeError = nil
-        claudeCodeSwitchTask = Task {
+        isSwitchingClaudeCode = true
+        Task {
             await performClaudeCodeSwitch(to: account)
-            claudeCodeSwitchTask = nil
+            isSwitchingClaudeCode = false
         }
     }
 
@@ -247,7 +268,10 @@ final class AccountStore: ObservableObject {
             // Get the target's tokens ready before taking the lock: this chain
             // isn't shared with Claude Code yet, so refreshing it here is safe,
             // and it keeps a network round trip out of the critical section.
-            let tokens = try await validTokens(for: account)
+            // The user just asked for this switch, so a prompt now is one they
+            // can connect to what they did.
+            let tokens = try await validTokens(for: account, allowClaudeCodeRefresh: true)
+            loadClaudeCodeProfilesIfNeeded()
             let profile = claudeCodeProfiles[account.id]
 
             // Prefer the account's own record if we've ever captured it;
@@ -274,7 +298,14 @@ final class AccountStore: ObservableObject {
             // Fold the outgoing account's salvaged state back in. Its tokens
             // may have been rotated by Claude Code since we last looked, which
             // would have left our copy dead.
-            if let outgoing = result.harvestedAccountID {
+            //
+            // Only for accounts we actually hold: Claude Code may have been
+            // signed in as one the user never added here, and filing a
+            // stranger's refresh token in the vault would retain a credential
+            // that no menu can select and `removeAccount` can never clear.
+            if let outgoing = result.harvestedAccountID,
+                accounts.contains(where: { $0.id == outgoing })
+            {
                 if let harvested = result.harvestedTokens {
                     loadVaultIfNeeded()
                     tokenVault[outgoing] = harvested
@@ -293,14 +324,28 @@ final class AccountStore: ObservableObject {
             }
 
             claudeCodeActiveID = account.id
+            ClaudeCodeSwitchPrompt.recordAcknowledged()
             await refresh(account: account, force: true)
         } catch {
             claudeCodeError = error.localizedDescription
         }
     }
 
-    private func loadClaudeCodeProfiles() {
-        guard let data = UserDefaults.standard.data(forKey: Self.claudeCodeProfilesKey),
+    /// Lazy for the same reason `loadVaultIfNeeded` is: nothing should touch
+    /// the Keychain just because the app launched. Every site that mutates
+    /// `claudeCodeProfiles` must call this first, or it would persist an empty
+    /// dictionary over the stored one.
+    private func loadClaudeCodeProfilesIfNeeded() {
+        guard !claudeCodeProfilesLoaded else { return }
+        claudeCodeProfilesLoaded = true
+
+        // Profiles used to live in UserDefaults. They're re-captured on the
+        // next switch and Claude Code refetches what it needs, so the old copy
+        // is purged rather than migrated — leaving credential-adjacent fields
+        // sitting in a plaintext plist is the thing being fixed.
+        UserDefaults.standard.removeObject(forKey: Self.legacyClaudeCodeProfilesKey)
+
+        guard let data = Keychain.load(account: Self.claudeCodeProfilesAccount),
             let decoded = try? JSONDecoder().decode(
                 [String: ClaudeCodeProfile].self, from: data)
         else { return }
@@ -309,7 +354,7 @@ final class AccountStore: ObservableObject {
 
     private func persistClaudeCodeProfiles() {
         if let data = try? JSONEncoder().encode(claudeCodeProfiles) {
-            UserDefaults.standard.set(data, forKey: Self.claudeCodeProfilesKey)
+            try? Keychain.save(data, account: Self.claudeCodeProfilesAccount)
         }
     }
 
@@ -366,7 +411,10 @@ final class AccountStore: ObservableObject {
         var state = states[account.id] ?? AccountDisplayState()
         do {
             let provider = Providers.provider(for: account.provider)
-            let token = try await validAccessToken(for: account)
+            // `force` means a person pressed something; a timer never gets to
+            // provoke a keychain dialog.
+            let token = try await validAccessToken(
+                for: account, allowClaudeCodeRefresh: force)
             let snapshot = try await provider.fetchUsage(
                 accessToken: token, accountID: account.id)
             state.limits = snapshot.limits
@@ -389,61 +437,85 @@ final class AccountStore: ObservableObject {
         states[account.id] = state
     }
 
-    private func validAccessToken(for account: AccountMeta) async throws -> String {
-        try await validTokens(for: account).accessToken
+    private func validAccessToken(
+        for account: AccountMeta, allowClaudeCodeRefresh: Bool
+    ) async throws -> String {
+        try await validTokens(for: account, allowClaudeCodeRefresh: allowClaudeCodeRefresh)
+            .accessToken
     }
 
-    /// Whether our mirrored copy can still be used as-is.
+    /// Dispatches on `TokenSource`, which is where the one rule that must not
+    /// bend lives: only the side that owns a chain may refresh it. Each branch
+    /// returns or throws, so the shared-chain case can't reach the refresh
+    /// below by falling through.
     ///
-    /// Rotation invalidates the *refresh* token, not the access token already
-    /// issued, so a copy Claude Code has since rotated past is still perfectly
-    /// good for reading usage until it expires. Leaning on that keeps us off
-    /// Claude Code's Keychain item — and off its authorization prompt — on all
-    /// but roughly one poll per token lifetime, instead of every five minutes.
-    private func hasUsableToken(for accountID: String) -> Bool {
-        guard let tokens = tokenVault[accountID] else { return false }
-        return tokens.expiresAt.timeIntervalSinceNow > 120
-    }
-
-    private func validTokens(for account: AccountMeta) async throws -> StoredTokens {
+    /// `allowClaudeCodeRefresh` carries "a person is waiting on this" down to
+    /// the one operation whose side effect the user will notice — see
+    /// `ClaudeCodeStore.activeAccessToken`.
+    private func validTokens(
+        for account: AccountMeta, allowClaudeCodeRefresh: Bool
+    ) async throws -> StoredTokens {
         loadVaultIfNeeded()
 
-        // While we manage sign-in, Claude Code's own store owns the signed-in
-        // account's token chain — both sides hold the same chain, refresh
-        // tokens are single-use, and an uncoordinated refresh here would sign
-        // the CLI out. Reading through it also picks up rotations Claude Code
-        // has already done, which would otherwise have left our copy dead.
-        if managesClaudeCodeSignIn, account.id == claudeCodeActiveID,
-            !hasUsableToken(for: account.id)
+        switch TokenSource.of(
+            accountID: account.id,
+            vault: tokenVault,
+            claudeCodeManages: managesClaudeCodeSignIn,
+            claudeCodeActiveID: claudeCodeActiveID)
         {
-            let provider = Providers.provider(for: account.provider)
-            if let tokens = try? await claudeCodeStore.activeAccessToken(refresh: {
-                try await provider.refresh(tokens: $0)
-            }) {
-                tokenVault[account.id] = tokens
-                persistVault()
-                return tokens
-            }
-            // Unreadable (authorization declined, or the format moved on):
-            // fall through to our own copy rather than stop reporting usage.
-        }
-
-        guard var tokens = tokenVault[account.id] else {
+        case .mirrored(let tokens):
+            return tokens
+        case .claudeCode:
+            return try await tokensThroughClaudeCode(
+                for: account, allowRefresh: allowClaudeCodeRefresh)
+        case .ownRefresh(let tokens):
+            return try await refreshOwnChain(tokens, for: account)
+        case .unauthorized:
             throw UsageError.unauthorized
         }
+    }
 
-        if tokens.expiresAt.timeIntervalSinceNow < 120 {
-            guard !tokens.refreshToken.isEmpty else { throw UsageError.unauthorized }
-            do {
-                let provider = Providers.provider(for: account.provider)
-                tokens = try await provider.refresh(tokens: tokens)
-                tokenVault[account.id] = tokens
-                persistVault()
-            } catch {
-                throw UsageError.unauthorized
-            }
+    /// Reads the signed-in account's tokens from Claude Code's store, letting
+    /// *it* do any refresh under its own lock. Reading through also picks up
+    /// rotations Claude Code has already done, which would otherwise have left
+    /// our copy dead.
+    ///
+    /// Throws rather than falling back on our mirrored copy. Reaching here
+    /// means that copy needs refreshing too, and refreshing it would rotate
+    /// the shared chain and sign the CLI out — the exact failure this whole
+    /// arrangement exists to prevent. One stale poll is much the cheaper loss,
+    /// and `.claudeCodeUnreadable` keeps it out of the reauth machinery.
+    private func tokensThroughClaudeCode(
+        for account: AccountMeta, allowRefresh: Bool
+    ) async throws -> StoredTokens {
+        let provider = Providers.provider(for: account.provider)
+        do {
+            let tokens = try await claudeCodeStore.activeAccessToken(
+                allowRefresh: allowRefresh,
+                refresh: { try await provider.refresh(tokens: $0) })
+            tokenVault[account.id] = tokens
+            persistVault()
+            return tokens
+        } catch {
+            // Authorization declined, the lock held by a running `claude`
+            // session, or the format moved on — all transient enough to retry
+            // on the next poll, none worth rotating the chain over.
+            throw UsageError.claudeCodeUnreadable
         }
-        return tokens
+    }
+
+    private func refreshOwnChain(
+        _ tokens: StoredTokens, for account: AccountMeta
+    ) async throws -> StoredTokens {
+        do {
+            let provider = Providers.provider(for: account.provider)
+            let refreshed = try await provider.refresh(tokens: tokens)
+            tokenVault[account.id] = refreshed
+            persistVault()
+            return refreshed
+        } catch {
+            throw UsageError.unauthorized
+        }
     }
 
     // MARK: - Token vault
