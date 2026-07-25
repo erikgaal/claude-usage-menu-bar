@@ -287,9 +287,6 @@ enum ClaudeCodeError: LocalizedError {
     case lockUnavailable
     case notSignedIn
     case unrecognizedFormat
-    /// Claude Code's token has expired and this poll isn't allowed to refresh
-    /// it, because doing so would prompt the user out of the blue.
-    case staleWithoutRefresh
 
     var errorDescription: String? {
         switch self {
@@ -299,8 +296,6 @@ enum ClaudeCodeError: LocalizedError {
             return "Claude Code isn't signed in yet. Sign in once with `claude`, then retry."
         case .unrecognizedFormat:
             return "Claude Code's credential format has changed; not touching it."
-        case .staleWithoutRefresh:
-            return "Waiting for Claude Code to refresh its own sign-in."
         }
     }
 }
@@ -311,8 +306,11 @@ enum ClaudeCodeError: LocalizedError {
 /// interesting parts stay unit-testable without a Keychain or a home directory.
 struct ClaudeCodeStore {
 
+    /// Reads through `/usr/bin/security` rather than `SecItemCopyMatching`, so
+    /// this app never needs an authorization of its own on Claude Code's item
+    /// — see `SecurityCLI`.
     func readCredentials() throws -> [String: Any]? {
-        guard let data = Keychain.load(
+        guard let data = try SecurityCLI.readGenericPassword(
             account: ClaudeCodeSession.credentialsAccount,
             service: ClaudeCodeSession.credentialsService)
         else { return nil }
@@ -322,39 +320,17 @@ struct ClaudeCodeStore {
         return object
     }
 
-    /// Updates the credential item in place, and costs the user a keychain
-    /// password prompt the next time Claude Code reads it. That cost is known
-    /// and currently unavoidable — see below.
+    /// Writes through `/usr/bin/security`, which is what keeps this whole
+    /// feature free of keychain dialogs — `SecurityCLI` explains why a direct
+    /// `SecItemUpdate` here would cost the CLI its silent access on every
+    /// switch.
     ///
-    /// Alongside its trusted-application list, a keychain item carries a
-    /// *partition list* (`apple:`, `apple-tool:`, `teamid:…`). A write from a
-    /// third-party-signed binary resets that list to the writer's own
-    /// `teamid:`, evicting `apple-tool:` — the partition `/usr/bin/security`
-    /// reads under. Claude Code reads its credentials by shelling out to
-    /// `security find-generic-password -w`, so after any write from this app
-    /// the CLI asks for the login keychain password once. "Always Allow"
-    /// clears it until the next switch.
-    ///
-    /// Measured in both directions: the same `SecItemUpdate` from an
-    /// Apple-signed binary leaves the partition list alone (which is why an
-    /// unsigned probe first cleared this path wrongly), and a rewrite through
-    /// `security` restores an evicted one.
-    ///
-    /// Two alternatives were tried and rejected:
-    ///
-    /// - Recreating the item with an explicit `SecAccess`. Fixes nothing — the
-    ///   partition list is separate from the ACL — and discards every other
-    ///   client's accumulated authorization along the way.
-    /// - Driving `security add-generic-password -U -w` and feeding the secret
-    ///   over stdin, so the writer is Apple-signed. The tool's interactive
-    ///   reader is `readpassphrase`, capped at `_PASSWORD_LEN` (128 bytes); a
-    ///   real payload is several KB and was silently truncated mid-token,
-    ///   destroying the sign-in. Passing `-w <value>` has no such limit but
-    ///   puts a live refresh token in the process list, which `security` itself
-    ///   warns against.
+    /// Callers must have established that the item exists (`switchAccount`
+    /// throws `.notSignedIn` otherwise): `-U` would otherwise create a sign-in
+    /// where the user has none.
     func writeCredentials(_ payload: [String: Any]) throws {
         let data = try JSONSerialization.data(withJSONObject: payload)
-        try Keychain.saveForeign(
+        try SecurityCLI.writeGenericPassword(
             data,
             account: ClaudeCodeSession.credentialsAccount,
             service: ClaudeCodeSession.credentialsService)
@@ -509,17 +485,7 @@ extension ClaudeCodeStore {
     /// out. The common path takes no lock at all, since a valid token only
     /// needs reading.
     ///
-    /// `allowRefresh` is false on background polls, and that restraint is the
-    /// point. Refreshing means writing the result back here, and a write costs
-    /// Claude Code its silent read (see `writeCredentials`) — so refreshing on
-    /// a timer would put a login-password dialog in front of the user at a
-    /// moment they did nothing to provoke, with no way to connect it to this
-    /// app. Read-only polls give up freshness instead, which costs almost
-    /// nothing: the token only expires while Claude Code is idle, and usage
-    /// doesn't move while it's idle. The moment it runs, it refreshes the chain
-    /// itself and the next poll reads the new token.
     func activeAccessToken(
-        allowRefresh: Bool,
         refresh: @Sendable (StoredTokens) async throws -> StoredTokens
     ) async throws -> StoredTokens {
         if let payload = try readCredentials(),
@@ -528,7 +494,6 @@ extension ClaudeCodeStore {
         {
             return current.tokens
         }
-        guard allowRefresh else { throw ClaudeCodeError.staleWithoutRefresh }
 
         return try await withWriteLock {
             // Re-read inside the lock: a `claude` session may have refreshed

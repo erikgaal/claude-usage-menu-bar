@@ -150,12 +150,10 @@ struct MenuContentView: View {
             }
             .help(
                 "Adds \"Use for Claude Code\" to each Claude account's menu, so you can "
-                    + "switch which account the CLI uses without signing in again. Each "
-                    + "switch costs one login keychain password prompt the next time "
-                    + "Claude Code runs — updating its credentials from another app is "
-                    + "what triggers it, and there's no way around it. Switching this "
-                    + "back off makes this app refresh that account's token on its own "
-                    + "again, which signs Claude Code out within the hour.")
+                    + "switch which account the CLI, the desktop app and the IDE "
+                    + "extensions use, without signing in again. Switching this back off "
+                    + "makes this app refresh that account's token on its own again, "
+                    + "which signs Claude Code out within the hour.")
             if let error = store.claudeCodeError {
                 Text(error)
                     .font(.caption)

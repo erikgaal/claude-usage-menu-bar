@@ -3,21 +3,12 @@ import Foundation
 
 /// One-time explainer shown before the first Claude Code account switch.
 ///
-/// Every switch costs the user one login-keychain password prompt, and it is
-/// worth being blunt about why, because the obvious reading — "the app is
-/// asking for permission once" — is wrong. Writing Claude Code's Keychain item
-/// from a third-party-signed binary resets that item's *partition list* to this
-/// app's team, evicting the `apple-tool:` entry that `/usr/bin/security` reads
-/// under. Claude Code reads its credentials by shelling out to `security`, so
-/// its next read is unauthorized and macOS asks for the password to restore it.
-/// The partition list is separate from the item's ACL, so no amount of access
-/// control on our side avoids this; see `ClaudeCodeStore.writeCredentials` for
-/// the approaches that were tried and why each failed.
-///
-/// So the honest framing is a recurring cost, disclosed once, rather than a
-/// one-off authorization. Shown a single time because a modal before every
-/// switch would be worse than the prompt it explains — the user needs to
-/// understand the pattern, not be reminded of it.
+/// There is no keychain dialog to warn about — `SecurityCLI` is what keeps the
+/// feature silent — so this exists for the other surprise: the switch is
+/// system-wide. It moves the `claude` command, the desktop app and the IDE
+/// extensions together, including sessions running in terminals the user isn't
+/// looking at. That is the whole point of the feature, and also the thing worth
+/// stating once before it happens rather than after.
 @MainActor
 enum ClaudeCodeSwitchPrompt {
     private static let acknowledgedKey = "acknowledgedClaudeCodeKeychainPrompt"
@@ -41,16 +32,12 @@ enum ClaudeCodeSwitchPrompt {
         alert.alertStyle = .informational
         alert.messageText = "Switch Claude Code to \(account.email)?"
         alert.informativeText = """
-            The next time Claude Code runs, macOS will ask for your login \
-            keychain password. This happens after every switch — updating the \
-            credentials from another app costs Claude Code its silent access, \
-            and only your password gives it back. Choose "Always Allow" to \
-            settle it until the next switch.
-
             This changes the account used by the claude command, the Claude \
-            Code desktop app, and the IDE extensions. Sessions you already \
-            have open switch over within about 30 seconds; there's no need to \
-            restart them.
+            Code desktop app, and the IDE extensions — everywhere on this Mac, \
+            not just here.
+
+            Sessions you already have open switch over within about 30 \
+            seconds; there's no need to restart them.
             """
         alert.addButton(withTitle: "Switch Account")
         alert.addButton(withTitle: "Cancel")

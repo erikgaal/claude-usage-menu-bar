@@ -268,9 +268,7 @@ final class AccountStore: ObservableObject {
             // Get the target's tokens ready before taking the lock: this chain
             // isn't shared with Claude Code yet, so refreshing it here is safe,
             // and it keeps a network round trip out of the critical section.
-            // The user just asked for this switch, so a prompt now is one they
-            // can connect to what they did.
-            let tokens = try await validTokens(for: account, allowClaudeCodeRefresh: true)
+            let tokens = try await validTokens(for: account)
             loadClaudeCodeProfilesIfNeeded()
             let profile = claudeCodeProfiles[account.id]
 
@@ -411,10 +409,7 @@ final class AccountStore: ObservableObject {
         var state = states[account.id] ?? AccountDisplayState()
         do {
             let provider = Providers.provider(for: account.provider)
-            // `force` means a person pressed something; a timer never gets to
-            // provoke a keychain dialog.
-            let token = try await validAccessToken(
-                for: account, allowClaudeCodeRefresh: force)
+            let token = try await validAccessToken(for: account)
             let snapshot = try await provider.fetchUsage(
                 accessToken: token, accountID: account.id)
             state.limits = snapshot.limits
@@ -437,24 +432,15 @@ final class AccountStore: ObservableObject {
         states[account.id] = state
     }
 
-    private func validAccessToken(
-        for account: AccountMeta, allowClaudeCodeRefresh: Bool
-    ) async throws -> String {
-        try await validTokens(for: account, allowClaudeCodeRefresh: allowClaudeCodeRefresh)
-            .accessToken
+    private func validAccessToken(for account: AccountMeta) async throws -> String {
+        try await validTokens(for: account).accessToken
     }
 
     /// Dispatches on `TokenSource`, which is where the one rule that must not
     /// bend lives: only the side that owns a chain may refresh it. Each branch
     /// returns or throws, so the shared-chain case can't reach the refresh
     /// below by falling through.
-    ///
-    /// `allowClaudeCodeRefresh` carries "a person is waiting on this" down to
-    /// the one operation whose side effect the user will notice — see
-    /// `ClaudeCodeStore.activeAccessToken`.
-    private func validTokens(
-        for account: AccountMeta, allowClaudeCodeRefresh: Bool
-    ) async throws -> StoredTokens {
+    private func validTokens(for account: AccountMeta) async throws -> StoredTokens {
         loadVaultIfNeeded()
 
         switch TokenSource.of(
@@ -466,8 +452,7 @@ final class AccountStore: ObservableObject {
         case .mirrored(let tokens):
             return tokens
         case .claudeCode:
-            return try await tokensThroughClaudeCode(
-                for: account, allowRefresh: allowClaudeCodeRefresh)
+            return try await tokensThroughClaudeCode(for: account)
         case .ownRefresh(let tokens):
             return try await refreshOwnChain(tokens, for: account)
         case .unauthorized:
@@ -486,12 +471,11 @@ final class AccountStore: ObservableObject {
     /// arrangement exists to prevent. One stale poll is much the cheaper loss,
     /// and `.claudeCodeUnreadable` keeps it out of the reauth machinery.
     private func tokensThroughClaudeCode(
-        for account: AccountMeta, allowRefresh: Bool
+        for account: AccountMeta
     ) async throws -> StoredTokens {
         let provider = Providers.provider(for: account.provider)
         do {
             let tokens = try await claudeCodeStore.activeAccessToken(
-                allowRefresh: allowRefresh,
                 refresh: { try await provider.refresh(tokens: $0) })
             tokenVault[account.id] = tokens
             persistVault()
