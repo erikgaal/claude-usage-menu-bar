@@ -12,6 +12,30 @@ enum KeychainError: LocalizedError {
     }
 }
 
+/// The slice of Keychain behavior `AccountStore` needs, as plain load/save/
+/// delete so tests can substitute an in-memory fake and never touch the real
+/// login keychain. The thin Security wrapper below stays untested by design.
+protocol KeychainStoring {
+    func save(_ data: Data, account: String) throws
+    func load(account: String) -> Data?
+    func delete(account: String)
+}
+
+/// Production storage backed by the real Keychain wrapper below.
+struct SystemKeychain: KeychainStoring {
+    func save(_ data: Data, account: String) throws {
+        try Keychain.save(data, account: account)
+    }
+
+    func load(account: String) -> Data? {
+        Keychain.load(account: account)
+    }
+
+    func delete(account: String) {
+        Keychain.delete(account: account)
+    }
+}
+
 enum Keychain {
     static let service = "dev.erikgaal.claude-usage"
     /// Single item holding every account's tokens (accountID → StoredTokens),
