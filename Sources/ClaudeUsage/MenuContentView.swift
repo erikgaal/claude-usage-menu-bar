@@ -204,6 +204,14 @@ struct AccountSection: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Rename…") { startRenaming() }
+            Divider()
+            // Order matters beyond the panel: it also sets the menu bar
+            // summary order, so surface reordering right where accounts live.
+            Button("Move Up") { store.moveAccount(account, by: -1) }
+                .disabled(store.accounts.first?.id == account.id)
+            Button("Move Down") { store.moveAccount(account, by: 1) }
+                .disabled(store.accounts.last?.id == account.id)
+            Divider()
             Button("Remove Account", role: .destructive) {
                 store.removeAccount(account)
             }
