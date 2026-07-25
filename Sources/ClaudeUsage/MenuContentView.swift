@@ -192,10 +192,17 @@ struct AccountSection: View {
 
     @State private var isRenaming = false
     @State private var draftName = ""
+    @State private var showsBestDetails = false
     @FocusState private var renameFocused: Bool
 
     private var state: AccountDisplayState {
         store.states[account.id] ?? AccountDisplayState()
+    }
+
+    /// Whether this account has same-provider company — the only case where
+    /// the best-account hint (and its debug breakdown) means anything.
+    private var hasProviderPeers: Bool {
+        store.accounts.filter { $0.provider == account.provider }.count >= 2
     }
 
     var body: some View {
@@ -239,6 +246,9 @@ struct AccountSection: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Rename…") { startRenaming() }
+            if hasProviderPeers {
+                Button("Best-account details…") { showsBestDetails = true }
+            }
             Divider()
             // Order matters beyond the panel: it also sets the menu bar
             // summary order, so surface reordering right where accounts live.
@@ -283,6 +293,12 @@ struct AccountSection: View {
             Spacer(minLength: 0)
             if let badge = store.bestBadges[account.id] {
                 BestBadge(badge: badge)
+                    .onTapGesture { showsBestDetails = true }
+            }
+        }
+        .popover(isPresented: $showsBestDetails, arrowEdge: .bottom) {
+            if let trace = store.bestAccountTrace(for: account.provider) {
+                BestAccountDebugView(trace: trace)
             }
         }
     }

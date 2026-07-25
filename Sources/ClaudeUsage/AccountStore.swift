@@ -118,6 +118,17 @@ final class AccountStore: ObservableObject {
             sessionProjections: sessionProjections, now: Date())
     }
 
+    /// The full evaluation behind the badge for one provider's account
+    /// group — same inputs as `bestBadges` (and `winners` is derived from
+    /// these traces), so the debug popover shows exactly what the ranking
+    /// decided and why.
+    func bestAccountTrace(for provider: ProviderID) -> BestAccount.GroupTrace? {
+        BestAccount.evaluate(
+            accounts: accounts, states: states,
+            sessionProjections: sessionProjections, now: Date()
+        ).first { $0.provider == provider }
+    }
+
     /// Projected session-window exhaustion per account id, from recorded
     /// burn-rate history. Accounts with no projectable pace (idle, thin
     /// history, mock mode) are simply absent.
