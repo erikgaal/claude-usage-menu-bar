@@ -31,14 +31,17 @@ extension HTTPURLResponse {
 enum UsageAPI {
     static let endpoint = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
-    static func fetchUsage(accessToken: String) async throws -> UsageSnapshot {
+    /// `session` is injectable for tests; production uses the shared session.
+    static func fetchUsage(
+        accessToken: String, session: URLSession = .shared
+    ) async throws -> UsageSnapshot {
         var request = URLRequest(url: endpoint)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 15
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 0
         if status == 401 || status == 403 {
