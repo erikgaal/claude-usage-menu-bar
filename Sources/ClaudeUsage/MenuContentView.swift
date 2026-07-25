@@ -142,6 +142,23 @@ struct MenuContentView: View {
             }
             NotificationsToggleRow(notifier: store.notifier)
             HStack {
+                Text("Manage Claude Code sign-in")
+                Spacer()
+                Toggle("", isOn: $store.managesClaudeCodeSignIn)
+                    .labelsHidden()
+                    .toggleStyle(.checkbox)
+            }
+            .help(
+                "Adds \"Use for Claude Code\" to each Claude account's menu, so you can "
+                    + "switch which account the CLI uses without signing in again. macOS "
+                    + "asks once for permission to update Claude Code's keychain item.")
+            if let error = store.claudeCodeError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
                 Spacer()
                 Button("Quit") {
                     NSApplication.shared.terminate(nil)
@@ -239,6 +256,16 @@ struct AccountSection: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Rename…") { startRenaming() }
+            if store.managesClaudeCodeSignIn && account.provider == .claude {
+                Divider()
+                Button("Use for Claude Code") {
+                    guard ClaudeCodeSwitchPrompt.confirm(switchingTo: account) else { return }
+                    store.useForClaudeCode(account)
+                }
+                    .disabled(
+                        store.claudeCodeActiveID == account.id
+                            || store.isSwitchingClaudeCode)
+            }
             Divider()
             // Order matters beyond the panel: it also sets the menu bar
             // summary order, so surface reordering right where accounts live.
@@ -281,6 +308,9 @@ struct AccountSection: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 0)
+            if store.claudeCodeActiveID == account.id {
+                ClaudeCodeBadge()
+            }
             if store.bestAccountIDs.contains(account.id) {
                 BestBadge()
             }
@@ -445,6 +475,20 @@ struct BestBadge: View {
             .padding(.vertical, 2)
             .background(Capsule().fill(Color.green.opacity(0.15)))
             .help("Most session headroom right now")
+    }
+}
+
+/// Marks the account Claude Code is currently signed in as. Same quiet
+/// treatment as `BestBadge` — it states a fact rather than urging an action.
+struct ClaudeCodeBadge: View {
+    var body: some View {
+        Text("CLI")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.blue)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color.blue.opacity(0.15)))
+            .help("Claude Code is signed in as this account")
     }
 }
 

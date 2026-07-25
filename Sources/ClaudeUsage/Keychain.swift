@@ -18,7 +18,16 @@ enum Keychain {
     /// so unlocking the app costs at most one Keychain prompt.
     static let vaultAccount = "oauth-tokens"
 
-    static func save(_ data: Data, account: String) throws {
+    /// `service` is a parameter rather than a constant because the app also
+    /// reads and writes Claude Code's own item (`Claude Code-credentials`) when
+    /// it manages the CLI's sign-in.
+    ///
+    /// Updating a foreign item this way is safe: `SecItemUpdate` leaves the
+    /// item's ACL intact (verified against a restricted probe item), and the
+    /// `Encrypt` authorization is granted to every application anyway, so
+    /// writes never prompt. Reads are the operation that costs an
+    /// authorization — see `AccountStore.hasUsableToken`.
+    static func save(_ data: Data, account: String, service: String = Keychain.service) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -35,7 +44,7 @@ enum Keychain {
         guard status == errSecSuccess else { throw KeychainError.status(status) }
     }
 
-    static func load(account: String) -> Data? {
+    static func load(account: String, service: String = Keychain.service) -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

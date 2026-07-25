@@ -14,6 +14,44 @@ final class AccountStore: ObservableObject {
     /// Local-notification manager; `refresh` feeds it old/new state diffs.
     let notifier = UsageNotifier()
 
+    /// Opt-in. While on, the app owns Claude Code's sign-in: it can point the
+    /// CLI at any Claude account here, and it defers to Claude Code's own
+    /// credential store for the account that's signed in.
+    @Published var managesClaudeCodeSignIn: Bool = UserDefaults.standard.bool(
+        forKey: AccountStore.claudeCodeEnabledKey)
+    {
+        didSet {
+            UserDefaults.standard.set(managesClaudeCodeSignIn, forKey: Self.claudeCodeEnabledKey)
+            refreshClaudeCodeActive()
+        }
+    }
+    /// Which account Claude Code is currently signed in as, when it's one we
+    /// know about. Read from `~/.claude.json`, so keeping it current costs
+    /// nothing and never prompts for Keychain access.
+    @Published private(set) var claudeCodeActiveID: String?
+    @Published var claudeCodeError: String?
+
+    private static let claudeCodeEnabledKey = "managesClaudeCodeSignIn"
+    private static let claudeCodeProfilesKey = "claudeCodeProfiles"
+
+    /// What we captured from Claude Code the last time an account was the one
+    /// signed in, so switching back restores it rather than replacing it with
+    /// the minimum we can synthesize. Token material is stripped out, so this
+    /// holds no secrets and belongs in UserDefaults rather than the Keychain.
+    struct ClaudeCodeProfile: Codable {
+        /// Credential payload minus tokens: `subscriptionType`, `scopes`, and
+        /// whatever Anthropic adds that we don't model.
+        var credentialExtras: Data?
+        /// The account's `oauthAccount` record — `seatTier`, billing, org and
+        /// rate-limit tiers. We can't derive these, and Claude Code only
+        /// refetches them lazily.
+        var identity: Data?
+    }
+
+    private let claudeCodeStore = ClaudeCodeStore()
+    private var claudeCodeProfiles: [String: ClaudeCodeProfile] = [:]
+    private var claudeCodeSwitchTask: Task<Void, Never>?
+
     private let defaultsKey = "accounts"
     /// Background poll cadence. The panel also refreshes on open when stale.
     private let pollInterval: TimeInterval = 300
@@ -38,6 +76,8 @@ final class AccountStore: ObservableObject {
             }
         #endif
         loadAccounts()
+        loadClaudeCodeProfiles()
+        refreshClaudeCodeActive()
         startRefreshLoop()
     }
 
@@ -127,6 +167,9 @@ final class AccountStore: ObservableObject {
         persistVault()
         Keychain.delete(account: account.id)  // legacy per-account item, if any
         UsageHistoryStore.shared.removeHistory(accountID: account.id)
+        claudeCodeProfiles[account.id] = nil
+        persistClaudeCodeProfiles()
+        if claudeCodeActiveID == account.id { claudeCodeActiveID = nil }
         persistAccounts()
     }
 
@@ -163,6 +206,113 @@ final class AccountStore: ObservableObject {
         Task { await self.refresh(account: meta, force: true) }
     }
 
+    // MARK: - Claude Code sign-in
+
+    /// Accounts this can switch between: Claude subscriptions we hold tokens
+    /// for. Codex accounts aren't Claude Code sign-ins.
+    var claudeCodeSwitchableAccounts: [AccountMeta] {
+        accounts.filter { $0.provider == .claude }
+    }
+
+    var isSwitchingClaudeCode: Bool { claudeCodeSwitchTask != nil }
+
+    /// Cheap enough to call on every panel open — it reads `~/.claude.json`
+    /// and never touches the Keychain.
+    func refreshClaudeCodeActive() {
+        guard managesClaudeCodeSignIn else {
+            claudeCodeActiveID = nil
+            return
+        }
+        claudeCodeActiveID = claudeCodeStore.currentAccountID()
+    }
+
+    /// Points Claude Code — and the desktop app and IDE extensions, which
+    /// share its credential store — at this account. Running `claude` sessions
+    /// pick the change up within ~30s when their credential cache next lapses;
+    /// they don't need restarting.
+    func useForClaudeCode(_ account: AccountMeta) {
+        guard managesClaudeCodeSignIn, account.provider == .claude,
+            claudeCodeSwitchTask == nil, account.id != claudeCodeActiveID
+        else { return }
+
+        claudeCodeError = nil
+        claudeCodeSwitchTask = Task {
+            await performClaudeCodeSwitch(to: account)
+            claudeCodeSwitchTask = nil
+        }
+    }
+
+    private func performClaudeCodeSwitch(to account: AccountMeta) async {
+        do {
+            // Get the target's tokens ready before taking the lock: this chain
+            // isn't shared with Claude Code yet, so refreshing it here is safe,
+            // and it keeps a network round trip out of the critical section.
+            let tokens = try await validTokens(for: account)
+            let profile = claudeCodeProfiles[account.id]
+
+            // Prefer the account's own record if we've ever captured it;
+            // otherwise the minimal block, which Claude Code fills in for
+            // itself on its next profile fetch.
+            let identity: Data
+            if let captured = profile?.identity,
+                let block = try? JSONSerialization.jsonObject(with: captured) as? [String: Any]
+            {
+                identity = try JSONSerialization.data(
+                    withJSONObject: ClaudeCodeSession.identityForRestore(block))
+            } else {
+                identity = try JSONSerialization.data(
+                    withJSONObject: ClaudeCodeSession.oauthAccount(for: account))
+            }
+
+            let result = try await claudeCodeStore.switchAccount(
+                to: account.id,
+                knownCurrentID: claudeCodeActiveID,
+                tokens: tokens,
+                extras: profile?.credentialExtras,
+                oauthAccount: identity)
+
+            // Fold the outgoing account's salvaged state back in. Its tokens
+            // may have been rotated by Claude Code since we last looked, which
+            // would have left our copy dead.
+            if let outgoing = result.harvestedAccountID {
+                if let harvested = result.harvestedTokens {
+                    loadVaultIfNeeded()
+                    tokenVault[outgoing] = harvested
+                    persistVault()
+                    states[outgoing]?.needsReauth = false
+                    states[outgoing]?.error = nil
+                }
+                if result.harvestedExtras != nil || result.harvestedIdentity != nil {
+                    claudeCodeProfiles[outgoing] = ClaudeCodeProfile(
+                        credentialExtras: result.harvestedExtras
+                            ?? claudeCodeProfiles[outgoing]?.credentialExtras,
+                        identity: result.harvestedIdentity
+                            ?? claudeCodeProfiles[outgoing]?.identity)
+                    persistClaudeCodeProfiles()
+                }
+            }
+
+            claudeCodeActiveID = account.id
+            await refresh(account: account, force: true)
+        } catch {
+            claudeCodeError = error.localizedDescription
+        }
+    }
+
+    private func loadClaudeCodeProfiles() {
+        guard let data = UserDefaults.standard.data(forKey: Self.claudeCodeProfilesKey),
+            let decoded = try? JSONDecoder().decode(
+                [String: ClaudeCodeProfile].self, from: data)
+        else { return }
+        claudeCodeProfiles = decoded
+    }
+
+    private func persistClaudeCodeProfiles() {
+        if let data = try? JSONEncoder().encode(claudeCodeProfiles) {
+            UserDefaults.standard.set(data, forKey: Self.claudeCodeProfilesKey)
+        }
+    }
+
     // MARK: - Refresh
 
     /// Manual refresh: retries everything, ignoring cooldowns and reauth state.
@@ -173,6 +323,7 @@ final class AccountStore: ObservableObject {
     /// Called when the panel opens: refresh only what's stale, respecting
     /// cooldowns, so opening the menu never causes a request burst.
     func refreshIfStale() {
+        refreshClaudeCodeActive()
         Task {
             await withTaskGroup(of: Void.self) { group in
                 for account in accounts {
@@ -239,7 +390,44 @@ final class AccountStore: ObservableObject {
     }
 
     private func validAccessToken(for account: AccountMeta) async throws -> String {
+        try await validTokens(for: account).accessToken
+    }
+
+    /// Whether our mirrored copy can still be used as-is.
+    ///
+    /// Rotation invalidates the *refresh* token, not the access token already
+    /// issued, so a copy Claude Code has since rotated past is still perfectly
+    /// good for reading usage until it expires. Leaning on that keeps us off
+    /// Claude Code's Keychain item — and off its authorization prompt — on all
+    /// but roughly one poll per token lifetime, instead of every five minutes.
+    private func hasUsableToken(for accountID: String) -> Bool {
+        guard let tokens = tokenVault[accountID] else { return false }
+        return tokens.expiresAt.timeIntervalSinceNow > 120
+    }
+
+    private func validTokens(for account: AccountMeta) async throws -> StoredTokens {
         loadVaultIfNeeded()
+
+        // While we manage sign-in, Claude Code's own store owns the signed-in
+        // account's token chain — both sides hold the same chain, refresh
+        // tokens are single-use, and an uncoordinated refresh here would sign
+        // the CLI out. Reading through it also picks up rotations Claude Code
+        // has already done, which would otherwise have left our copy dead.
+        if managesClaudeCodeSignIn, account.id == claudeCodeActiveID,
+            !hasUsableToken(for: account.id)
+        {
+            let provider = Providers.provider(for: account.provider)
+            if let tokens = try? await claudeCodeStore.activeAccessToken(refresh: {
+                try await provider.refresh(tokens: $0)
+            }) {
+                tokenVault[account.id] = tokens
+                persistVault()
+                return tokens
+            }
+            // Unreadable (authorization declined, or the format moved on):
+            // fall through to our own copy rather than stop reporting usage.
+        }
+
         guard var tokens = tokenVault[account.id] else {
             throw UsageError.unauthorized
         }
@@ -255,7 +443,7 @@ final class AccountStore: ObservableObject {
                 throw UsageError.unauthorized
             }
         }
-        return tokens.accessToken
+        return tokens
     }
 
     // MARK: - Token vault
