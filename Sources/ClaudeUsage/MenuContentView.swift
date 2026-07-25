@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MenuContentView: View {
     @ObservedObject var store: AccountStore
+    @ObservedObject var updateChecker: UpdateChecker
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -120,6 +121,18 @@ struct MenuContentView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let release = updateChecker.availableRelease {
+                Button {
+                    NSWorkspace.shared.open(release.url)
+                } label: {
+                    Label(
+                        "Update available — v\(release.version)",
+                        systemImage: "arrow.down.circle")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.tint)
+                .help("Open the release page")
+            }
             HStack {
                 Text("Launch at login")
                 Spacer()

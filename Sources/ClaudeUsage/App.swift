@@ -5,10 +5,11 @@ import SwiftUI
 struct ClaudeUsageApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = AccountStore()
+    @StateObject private var updateChecker = UpdateChecker()
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContentView(store: store)
+            MenuContentView(store: store, updateChecker: updateChecker)
         } label: {
             MenuBarLabel(store: store)
         }
