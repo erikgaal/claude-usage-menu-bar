@@ -342,16 +342,24 @@ struct AccountSection: View {
         return "\(reset) · \(pace)"
     }
 
+    private func paceText(for group: ResetGroup, resetsAt: Date) -> String? {
+        Self.paceText(
+            rows: group.rows, resetsAt: resetsAt, accountID: account.id, history: .shared)
+    }
+
     /// The projection worth showing for a reset group, if any: the limit that
     /// runs out soonest — and only when it lands *before* the window resets on
-    /// its own, since running out after the reset is a non-event.
-    private func paceText(for group: ResetGroup, resetsAt: Date) -> String? {
+    /// its own, since running out after the reset is a non-event. Static with
+    /// an injected store so tests can drive the gates with synthetic history.
+    static func paceText(
+        rows: [LimitStatus], resetsAt: Date, accountID: String, history: UsageHistoryStore
+    ) -> String? {
         var soonest: (limit: LimitStatus, at: Date)?
-        for limit in group.rows {
+        for limit in rows {
             // Low-utilization slopes extrapolate to noise; don't project them.
             guard limit.percent >= 25,
-                let projected = UsageHistoryStore.shared.projectedExhaustion(
-                    accountID: account.id, limitID: limit.id),
+                let projected = history.projectedExhaustion(
+                    accountID: accountID, limitID: limit.id),
                 projected < resetsAt
             else { continue }
             if soonest == nil || projected < soonest!.at {
@@ -360,8 +368,8 @@ struct AccountSection: View {
         }
         guard let soonest else { return nil }
         // With several bars sharing the line, name the one that runs out.
-        let prefix = group.rows.count > 1 ? "\(soonest.limit.name) " : ""
-        return "\(prefix)on pace to run out \(Self.exhaustionTimeText(soonest.at))"
+        let prefix = rows.count > 1 ? "\(soonest.limit.name) " : ""
+        return "\(prefix)on pace to run out \(exhaustionTimeText(soonest.at))"
     }
 
     /// "14:00" when the projection lands today, "Thu 14:00" otherwise —
