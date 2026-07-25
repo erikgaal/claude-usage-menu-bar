@@ -27,6 +27,12 @@ enum CodexConfig {
 struct CodexProvider: UsageProvider {
     let id = ProviderID.codex
     let accountKind = "Add Codex Account… (ChatGPT)"
+    /// Session used for usage fetches; injectable for tests, shared in production.
+    let session: URLSession
+
+    init(session: URLSession = .shared) {
+        self.session = session
+    }
 
     // MARK: - Login
 
@@ -231,7 +237,7 @@ struct CodexProvider: UsageProvider {
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             request.timeoutInterval = 15
 
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             let http = response as? HTTPURLResponse
             let status = http?.statusCode ?? 0
             if status == 401 {

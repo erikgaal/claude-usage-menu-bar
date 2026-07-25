@@ -12,16 +12,20 @@ final class AccountStore: ObservableObject {
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
 
     /// Local-notification manager; `refresh` feeds it old/new state diffs.
-    let notifier = UsageNotifier()
+    let notifier: UsageNotifier
 
     /// Opt-in. While on, the app owns Claude Code's sign-in: it can point the
     /// CLI at any Claude account here, and it defers to Claude Code's own
     /// credential store for the account that's signed in.
-    @Published var managesClaudeCodeSignIn: Bool = UserDefaults.standard.bool(
-        forKey: AccountStore.claudeCodeEnabledKey)
-    {
+    ///
+    /// Loaded from the injected `defaults` in `init` rather than initialized
+    /// inline, so it can't reach `UserDefaults.standard`. That matters beyond
+    /// tidiness: with the real suite, a test suite running on a machine where
+    /// this is on would drive the switching paths against the developer's own
+    /// Claude Code credentials.
+    @Published var managesClaudeCodeSignIn: Bool {
         didSet {
-            UserDefaults.standard.set(managesClaudeCodeSignIn, forKey: Self.claudeCodeEnabledKey)
+            defaults.set(managesClaudeCodeSignIn, forKey: Self.claudeCodeEnabledKey)
             refreshClaudeCodeActive()
         }
     }
@@ -75,7 +79,50 @@ final class AccountStore: ObservableObject {
     private var tokenVault: [String: StoredTokens] = [:]
     private var vaultLoaded = false
 
-    init() {
+    /// Resolves the provider implementation for an account; injectable so
+    /// tests can substitute canned responses for the real network clients.
+    private let providerFactory: (ProviderID) -> any UsageProvider
+    /// Token-vault storage: the real Keychain in production, in-memory fakes
+    /// in tests.
+    private let keychain: any KeychainStoring
+    /// Backing store for the persisted account list.
+    private let defaults: UserDefaults
+    /// Burn-rate history sink fed by every successful refresh.
+    private let history: UsageHistoryStore
+
+    /// Production wiring, used by the app (and by mock mode, which returns
+    /// early with fake data before touching any of these dependencies).
+    convenience init() {
+        self.init(
+            providerFactory: Providers.provider(for:),
+            keychain: SystemKeychain(),
+            defaults: .standard,
+            history: .shared,
+            notifier: UsageNotifier(),
+            startsRefreshLoop: true
+        )
+    }
+
+    /// Injection point for tests: every effectful dependency is a parameter,
+    /// and `startsRefreshLoop: false` keeps the infinite polling task from
+    /// starting so tests drive each refresh explicitly.
+    init(
+        providerFactory: @escaping (ProviderID) -> any UsageProvider,
+        keychain: any KeychainStoring,
+        defaults: UserDefaults,
+        history: UsageHistoryStore,
+        notifier: UsageNotifier,
+        startsRefreshLoop: Bool
+    ) {
+        self.providerFactory = providerFactory
+        self.keychain = keychain
+        self.defaults = defaults
+        self.history = history
+        self.notifier = notifier
+        // Not a `didSet` trigger: property observers stay quiet during init,
+        // which is what we want — `refreshClaudeCodeActive()` runs below, once
+        // the account list is loaded and can be checked against.
+        self.managesClaudeCodeSignIn = defaults.bool(forKey: Self.claudeCodeEnabledKey)
         #if DEBUG
             if Mock.isEnabled {
                 accounts = Mock.accounts
@@ -86,7 +133,7 @@ final class AccountStore: ObservableObject {
         #endif
         loadAccounts()
         refreshClaudeCodeActive()
-        startRefreshLoop()
+        if startsRefreshLoop { startRefreshLoop() }
     }
 
     // MARK: - Menu bar summary
@@ -132,7 +179,7 @@ final class AccountStore: ObservableObject {
         addAccountError = nil
         loginTask = Task {
             do {
-                let result = try await Providers.provider(for: providerID).login()
+                let result = try await providerFactory(providerID).login()
                 try storeLogin(result, provider: providerID)
             } catch is CancellationError {
                 // user cancelled — nothing to report
@@ -173,8 +220,8 @@ final class AccountStore: ObservableObject {
         loadVaultIfNeeded()
         tokenVault[account.id] = nil
         persistVault()
-        Keychain.delete(account: account.id)  // legacy per-account item, if any
-        UsageHistoryStore.shared.removeHistory(accountID: account.id)
+        keychain.delete(account: account.id)  // legacy per-account item, if any
+        history.removeHistory(accountID: account.id)
         loadClaudeCodeProfilesIfNeeded()
         claudeCodeProfiles[account.id] = nil
         persistClaudeCodeProfiles()
@@ -190,7 +237,7 @@ final class AccountStore: ObservableObject {
         beginAddAccount(provider: account.provider)
     }
 
-    private func storeLogin(_ result: LoginResult, provider: ProviderID) throws {
+    func storeLogin(_ result: LoginResult, provider: ProviderID) throws {
         loadVaultIfNeeded()
         tokenVault[result.accountID] = result.tokens
         persistVault()
@@ -341,9 +388,9 @@ final class AccountStore: ObservableObject {
         // next switch and Claude Code refetches what it needs, so the old copy
         // is purged rather than migrated — leaving credential-adjacent fields
         // sitting in a plaintext plist is the thing being fixed.
-        UserDefaults.standard.removeObject(forKey: Self.legacyClaudeCodeProfilesKey)
+        defaults.removeObject(forKey: Self.legacyClaudeCodeProfilesKey)
 
-        guard let data = Keychain.load(account: Self.claudeCodeProfilesAccount),
+        guard let data = keychain.load(account: Self.claudeCodeProfilesAccount),
             let decoded = try? JSONDecoder().decode(
                 [String: ClaudeCodeProfile].self, from: data)
         else { return }
@@ -352,7 +399,7 @@ final class AccountStore: ObservableObject {
 
     private func persistClaudeCodeProfiles() {
         if let data = try? JSONEncoder().encode(claudeCodeProfiles) {
-            try? Keychain.save(data, account: Self.claudeCodeProfilesAccount)
+            try? keychain.save(data, account: Self.claudeCodeProfilesAccount)
         }
     }
 
@@ -398,7 +445,7 @@ final class AccountStore: ObservableObject {
         }
     }
 
-    private func refresh(account: AccountMeta, force: Bool) async {
+    func refresh(account: AccountMeta, force: Bool) async {
         if !force {
             // Don't hammer the token endpoint for accounts that need the user,
             // and honor 429 backoff deadlines.
@@ -408,14 +455,14 @@ final class AccountStore: ObservableObject {
 
         var state = states[account.id] ?? AccountDisplayState()
         do {
-            let provider = Providers.provider(for: account.provider)
+            let provider = providerFactory(account.provider)
             let token = try await validAccessToken(for: account)
             let snapshot = try await provider.fetchUsage(
                 accessToken: token, accountID: account.id)
             state.limits = snapshot.limits
             state.credits = snapshot.credits
             state.lastUpdated = Date()
-            UsageHistoryStore.shared.record(snapshot.limits, accountID: account.id)
+            history.record(snapshot.limits, accountID: account.id)
             state.error = nil
             state.needsReauth = false
             cooldownUntil[account.id] = nil
@@ -473,7 +520,7 @@ final class AccountStore: ObservableObject {
     private func tokensThroughClaudeCode(
         for account: AccountMeta
     ) async throws -> StoredTokens {
-        let provider = Providers.provider(for: account.provider)
+        let provider = providerFactory(account.provider)
         do {
             let tokens = try await claudeCodeStore.activeAccessToken(
                 refresh: { try await provider.refresh(tokens: $0) })
@@ -492,7 +539,7 @@ final class AccountStore: ObservableObject {
         _ tokens: StoredTokens, for account: AccountMeta
     ) async throws -> StoredTokens {
         do {
-            let provider = Providers.provider(for: account.provider)
+            let provider = providerFactory(account.provider)
             let refreshed = try await provider.refresh(tokens: tokens)
             tokenVault[account.id] = refreshed
             persistVault()
@@ -510,17 +557,17 @@ final class AccountStore: ObservableObject {
         guard !vaultLoaded else { return }
         vaultLoaded = true
 
-        if let data = Keychain.load(account: Keychain.vaultAccount),
+        if let data = keychain.load(account: Keychain.vaultAccount),
             let decoded = try? JSONDecoder().decode([String: StoredTokens].self, from: data) {
             tokenVault = decoded
         }
 
         var migrated = false
         for account in accounts where tokenVault[account.id] == nil {
-            if let data = Keychain.load(account: account.id),
+            if let data = keychain.load(account: account.id),
                 let tokens = try? JSONDecoder().decode(StoredTokens.self, from: data) {
                 tokenVault[account.id] = tokens
-                Keychain.delete(account: account.id)
+                keychain.delete(account: account.id)
                 migrated = true
             }
         }
@@ -529,7 +576,7 @@ final class AccountStore: ObservableObject {
 
     private func persistVault() {
         if let data = try? JSONEncoder().encode(tokenVault) {
-            try? Keychain.save(data, account: Keychain.vaultAccount)
+            try? keychain.save(data, account: Keychain.vaultAccount)
         }
     }
 
@@ -551,7 +598,7 @@ final class AccountStore: ObservableObject {
     // MARK: - Persistence
 
     private func loadAccounts() {
-        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+        guard let data = defaults.data(forKey: defaultsKey),
             let decoded = try? JSONDecoder().decode([AccountMeta].self, from: data)
         else { return }
         accounts = decoded
@@ -559,7 +606,7 @@ final class AccountStore: ObservableObject {
 
     private func persistAccounts() {
         if let data = try? JSONEncoder().encode(accounts) {
-            UserDefaults.standard.set(data, forKey: defaultsKey)
+            defaults.set(data, forKey: defaultsKey)
         }
     }
 }
