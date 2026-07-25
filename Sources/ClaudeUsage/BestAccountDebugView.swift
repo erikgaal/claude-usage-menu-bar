@@ -78,10 +78,10 @@ struct BestAccountDebugView: View {
     }
 
     private func planText(_ candidate: BestAccount.CandidateTrace) -> String {
-        guard let multiplier = candidate.quotaMultiplier else { return "plan not set" }
-        let value = multiplier == multiplier.rounded()
-            ? String(Int(multiplier)) : String(format: "%.1f", multiplier)
-        return "×\(value)"
+        guard let quota = candidate.quota else { return "plan not set" }
+        let value = quota.multiplier == quota.multiplier.rounded()
+            ? String(Int(quota.multiplier)) : String(format: "%.1f", quota.multiplier)
+        return quota.source == .detected ? "×\(value) (auto)" : "×\(value)"
     }
 
     private func isBadged(_ candidate: BestAccount.CandidateTrace) -> Bool {

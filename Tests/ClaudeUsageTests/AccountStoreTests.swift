@@ -34,8 +34,10 @@ private final class ProviderFake: UsageProvider, @unchecked Sendable {
     private var _fetchResult: Result<UsageSnapshot, Error>
     private var _refreshResult: Result<StoredTokens, Error>
     private var _loginResult: Result<LoginResult, Error>
+    private var _profileResult: Result<DetectedPlan?, Error>
     private var _fetchCalls: [(accessToken: String, accountID: String)] = []
     private var _refreshCalls: [StoredTokens] = []
+    private var _profileCalls: [String] = []
 
     init(
         id: ProviderID = .claude,
@@ -45,6 +47,7 @@ private final class ProviderFake: UsageProvider, @unchecked Sendable {
         _fetchResult = fetchResult
         _refreshResult = .failure(UsageError.http(0, "token refresh not stubbed"))
         _loginResult = .failure(UsageError.http(0, "login not stubbed"))
+        _profileResult = .success(nil)
     }
 
     var fetchResult: Result<UsageSnapshot, Error> {
@@ -59,11 +62,18 @@ private final class ProviderFake: UsageProvider, @unchecked Sendable {
         get { lock.withLock { _loginResult } }
         set { lock.withLock { _loginResult = newValue } }
     }
+    var profileResult: Result<DetectedPlan?, Error> {
+        get { lock.withLock { _profileResult } }
+        set { lock.withLock { _profileResult = newValue } }
+    }
     var fetchCalls: [(accessToken: String, accountID: String)] {
         lock.withLock { _fetchCalls }
     }
     var refreshCalls: [StoredTokens] {
         lock.withLock { _refreshCalls }
+    }
+    var profileCalls: [String] {
+        lock.withLock { _profileCalls }
     }
 
     func setFetchResult(_ result: Result<UsageSnapshot, Error>, forAccount accountID: String) {
@@ -86,6 +96,14 @@ private final class ProviderFake: UsageProvider, @unchecked Sendable {
         let result: Result<UsageSnapshot, Error> = lock.withLock {
             _fetchCalls.append((accessToken, accountID))
             return _fetchResultsByAccount[accountID] ?? _fetchResult
+        }
+        return try result.get()
+    }
+
+    func fetchProfile(accessToken: String) async throws -> DetectedPlan? {
+        let result: Result<DetectedPlan?, Error> = lock.withLock {
+            _profileCalls.append(accessToken)
+            return _profileResult
         }
         return try result.get()
     }
@@ -642,6 +660,9 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(harness.store.accounts.first?.provider, .claude)
         XCTAssertNil(harness.store.accounts.first?.label)
         XCTAssertNil(harness.store.accounts.first?.quotaMultiplier)
+        XCTAssertNil(harness.store.accounts.first?.detectedRateLimitTier)
+        XCTAssertNil(harness.store.accounts.first?.detectedQuotaMultiplier)
+        XCTAssertNil(harness.store.accounts.first?.effectiveQuotaMultiplier)
         XCTAssertEqual(harness.store.accounts.first?.displayLabel, "Claude")
     }
 
@@ -663,6 +684,85 @@ final class AccountStoreTests: XCTestCase {
         reloaded.store.setQuotaMultiplier(account, to: nil)
         XCTAssertNil(reloaded.store.accounts.first?.quotaMultiplier)
         XCTAssertNil(try decodedAccounts(in: defaults).first?.quotaMultiplier)
+    }
+
+    // MARK: Plan detection
+
+    func testRefreshDetectsPlanTierOncePerLaunch() async throws {
+        let account = makeAccount()
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
+        provider.profileResult = .success(
+            DetectedPlan(rateLimitTier: "default_claude_max_5x", quotaMultiplier: 5))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()])
+
+        await harness.store.refresh(account: account, force: false)
+        await waitFor { harness.store.accounts.first?.detectedQuotaMultiplier == 5 }
+
+        XCTAssertEqual(
+            harness.store.accounts.first?.detectedRateLimitTier, "default_claude_max_5x")
+        // The detection is persisted alongside the account metadata…
+        XCTAssertEqual(
+            try decodedAccounts(in: harness.defaults).first?.detectedQuotaMultiplier, 5)
+        // …and not refetched on the next refresh.
+        await harness.store.refresh(account: account, force: true)
+        XCTAssertEqual(provider.profileCalls.count, 1)
+    }
+
+    func testProfileFailureIsSilentAndNeverAffectsUsage() async {
+        let account = makeAccount()
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot(percents: [42])))
+        provider.profileResult = .failure(UsageError.http(500, "profile boom"))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()],
+            notificationsEnabled: true)
+
+        await harness.store.refresh(account: account, force: false)
+        await waitFor { provider.profileCalls.count == 1 }
+
+        // Usage is intact, no error surfaced, nothing detected, no alerts.
+        let state = harness.store.states[account.id]
+        XCTAssertEqual(state?.limits.map(\.percent), [42])
+        XCTAssertNil(state?.error)
+        XCTAssertNil(harness.store.accounts.first?.detectedQuotaMultiplier)
+        XCTAssertTrue(harness.scheduler.posted.isEmpty)
+
+        // Failed detection is not retried this launch (no polling loop).
+        await harness.store.refresh(account: account, force: true)
+        XCTAssertEqual(provider.profileCalls.count, 1)
+    }
+
+    func testStoreLoginTriggersPlanDetection() async throws {
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
+        provider.profileResult = .success(
+            DetectedPlan(rateLimitTier: "default_claude_max_20x", quotaMultiplier: 20))
+        let harness = makeHarness(provider: provider)
+
+        try harness.store.storeLogin(makeLogin(), provider: .claude)
+
+        await waitFor { harness.store.accounts.first?.detectedQuotaMultiplier == 20 }
+        XCTAssertEqual(
+            harness.store.accounts.first?.detectedRateLimitTier, "default_claude_max_20x")
+    }
+
+    func testManualPlanChoiceOutranksDetectedTier() async {
+        let account = makeAccount()
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
+        provider.profileResult = .success(
+            DetectedPlan(rateLimitTier: "default_claude_max_5x", quotaMultiplier: 5))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()])
+
+        await harness.store.refresh(account: account, force: false)
+        await waitFor { harness.store.accounts.first?.detectedQuotaMultiplier == 5 }
+        XCTAssertEqual(harness.store.accounts.first?.effectiveQuotaMultiplier, 5)
+
+        harness.store.setQuotaMultiplier(account, to: 20)
+        XCTAssertEqual(harness.store.accounts.first?.effectiveQuotaMultiplier, 20)
+
+        // Clearing the manual choice falls back to the detected tier.
+        harness.store.setQuotaMultiplier(account, to: nil)
+        XCTAssertEqual(harness.store.accounts.first?.effectiveQuotaMultiplier, 5)
     }
 
     // MARK: Menu bar summary

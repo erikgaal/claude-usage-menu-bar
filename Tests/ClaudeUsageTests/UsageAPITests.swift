@@ -417,4 +417,105 @@ final class UsageAPITests: XCTestCase {
         XCTAssertEqual(snapshot.limits, [])
         XCTAssertNil(snapshot.credits)
     }
+
+    // MARK: Profile (plan detection)
+
+    /// Real response shape observed live (values sanitized): an org-billed
+    /// Max 5× Team account whose account-level plan booleans are false —
+    /// which is exactly why `organization.rate_limit_tier` is authoritative.
+    private static let profileJSON = """
+        {
+          "account": {
+            "uuid": "aaaaaaaa-1111-2222-3333-444444444444",
+            "full_name": "Erik", "display_name": "Erik",
+            "email": "user@example.com",
+            "has_claude_max": false, "has_claude_pro": false,
+            "created_at": "2026-07-14T14:26:09.105965Z"
+          },
+          "organization": {
+            "uuid": "bbbbbbbb-1111-2222-3333-444444444444",
+            "name": "ExampleOrg",
+            "organization_type": "claude_team",
+            "billing_type": "stripe_subscription",
+            "rate_limit_tier": "default_claude_max_5x",
+            "seat_tier": "team_tier_1",
+            "has_extra_usage_enabled": true,
+            "subscription_status": "active"
+          },
+          "application": { "uuid": "…", "name": "Claude Code", "slug": "claude-code" }
+        }
+        """
+
+    func testProfileResponseDecodesTierAndBooleans() throws {
+        let parsed = try JSONDecoder().decode(
+            ProfileResponse.self, from: Data(Self.profileJSON.utf8))
+        XCTAssertEqual(parsed.organization?.rateLimitTier, "default_claude_max_5x")
+        XCTAssertEqual(parsed.account?.hasClaudeMax, false)
+        XCTAssertEqual(parsed.account?.hasClaudePro, false)
+    }
+
+    func testTierMappingTable() {
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "default_claude_max_5x"), 5)
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "default_claude_max_20x"), 20)
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "default_claude_pro"), 1)
+        // Unknown strings are never guessed at…
+        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: "default_claude_enterprise"))
+        // …and a present-but-unknown tier outranks the unreliable booleans.
+        XCTAssertNil(
+            ClaudeTier.multiplier(
+                forRateLimitTier: "default_claude_enterprise", hasClaudePro: true))
+        // With no tier string at all, has_claude_pro is a last-resort hint.
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: nil, hasClaudePro: true), 1)
+        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: nil, hasClaudePro: false))
+        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: nil, hasClaudePro: nil))
+    }
+
+    func testFetchProfileSendsUsageHeadersToProfileEndpoint() async throws {
+        URLProtocolStub.handler = { request in
+            (URLProtocolStub.httpResponse(for: request, status: 200),
+             Data(Self.profileJSON.utf8))
+        }
+
+        let plan = try await UsageAPI.fetchProfile(
+            accessToken: "token-123", session: URLProtocolStub.makeSession())
+
+        XCTAssertEqual(plan.rateLimitTier, "default_claude_max_5x")
+        XCTAssertEqual(plan.quotaMultiplier, 5)
+
+        let request = try XCTUnwrap(URLProtocolStub.requests.first)
+        XCTAssertEqual(request.url, UsageAPI.profileEndpoint)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token-123")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-beta"), "oauth-2025-04-20")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+    }
+
+    func testFetchProfileNon200Throws() async {
+        URLProtocolStub.handler = { request in
+            (URLProtocolStub.httpResponse(for: request, status: 401), Data())
+        }
+        do {
+            _ = try await UsageAPI.fetchProfile(
+                accessToken: "token", session: URLProtocolStub.makeSession())
+            XCTFail("Expected fetchProfile to throw")
+        } catch {
+            guard case .http(let status, _)? = error as? UsageError else {
+                return XCTFail("Expected .http, got \(error)")
+            }
+            XCTAssertEqual(status, 401)
+        }
+    }
+
+    func testFetchProfileMalformedBodyThrows() async {
+        URLProtocolStub.handler = { request in
+            (URLProtocolStub.httpResponse(for: request, status: 200),
+             Data(#"{"organization": "nope"}"#.utf8))
+        }
+        do {
+            _ = try await UsageAPI.fetchProfile(
+                accessToken: "token", session: URLProtocolStub.makeSession())
+            XCTFail("Expected fetchProfile to throw")
+        } catch {
+            XCTAssertTrue(error is DecodingError, "Expected DecodingError, got \(error)")
+        }
+    }
 }

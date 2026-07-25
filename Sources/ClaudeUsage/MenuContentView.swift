@@ -216,6 +216,24 @@ struct AccountSection: View {
         )
     }
 
+    /// Label for the picker's nil (no manual choice) entry: names the
+    /// detected tier when detection succeeded, "Not set" otherwise.
+    private var autoPlanLabel: String {
+        guard let detected = store.accounts.first(where: { $0.id == account.id })?
+            .detectedQuotaMultiplier
+        else { return "Not set" }
+        return "Auto (\(Self.planName(for: detected)))"
+    }
+
+    static func planName(for multiplier: Double) -> String {
+        switch multiplier {
+        case 1: return "Pro"
+        case 5: return "Max 5×"
+        case 20: return "Max 20×"
+        default: return "×\(Int(multiplier))"
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             titleRow
@@ -265,7 +283,9 @@ struct AccountSection: View {
                     Text("Pro (×1)").tag(Optional(1.0))
                     Text("Max 5× (×5)").tag(Optional(5.0))
                     Text("Max 20× (×20)").tag(Optional(20.0))
-                    Text("Not set").tag(Optional<Double>.none)
+                    // No manual choice: auto-detected tier when we have
+                    // one, plain "Not set" otherwise.
+                    Text(autoPlanLabel).tag(Optional<Double>.none)
                 }
             }
             if hasProviderPeers {

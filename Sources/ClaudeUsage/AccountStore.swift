@@ -21,6 +21,9 @@ final class AccountStore: ObservableObject {
     private let staleAfter: TimeInterval = 120
     /// Per-account backoff deadlines set by 429 responses.
     private var cooldownUntil: [String: Date] = [:]
+    /// Accounts whose plan tier we already tried to detect this launch —
+    /// detection is opportunistic, not a polling loop.
+    private var planDetectionAttempted: Set<String> = []
     private var refreshLoop: Task<Void, Never>?
     private var loginTask: Task<Void, Never>?
 
@@ -117,7 +120,7 @@ final class AccountStore: ObservableObject {
             accounts: accounts, states: states,
             sessionProjections: sessionProjections,
             sessionBurnRates: sessionBurnRates,
-            quotaMultipliers: quotaMultipliers, now: Date())
+            quotas: quotas, now: Date())
     }
 
     /// The full evaluation behind the badge for one provider's account
@@ -129,21 +132,24 @@ final class AccountStore: ObservableObject {
             accounts: accounts, states: states,
             sessionProjections: sessionProjections,
             sessionBurnRates: sessionBurnRates,
-            quotaMultipliers: quotaMultipliers, now: Date()
+            quotas: quotas, now: Date()
         ).first { $0.provider == provider }
     }
 
-    /// User-declared plan multipliers, keyed by account id; accounts with
-    /// no plan set are simply absent (the ranking then assumes equal quotas
-    /// for that whole provider group).
-    private var quotaMultipliers: [String: Double] {
-        var multipliers: [String: Double] = [:]
+    /// Plan multipliers keyed by account id — the user's manual choice wins,
+    /// the API-detected tier fills in otherwise; accounts with neither are
+    /// simply absent (the ranking then assumes equal quotas for that whole
+    /// provider group).
+    private var quotas: [String: BestAccount.Quota] {
+        var quotas: [String: BestAccount.Quota] = [:]
         for account in accounts {
-            if let multiplier = account.quotaMultiplier {
-                multipliers[account.id] = multiplier
+            if let manual = account.quotaMultiplier {
+                quotas[account.id] = BestAccount.Quota(multiplier: manual, source: .manual)
+            } else if let detected = account.detectedQuotaMultiplier {
+                quotas[account.id] = BestAccount.Quota(multiplier: detected, source: .detected)
             }
         }
-        return multipliers
+        return quotas
     }
 
     /// Projected session-window exhaustion per account id, from recorded
@@ -273,6 +279,35 @@ final class AccountStore: ObservableObject {
         persistAccounts()
 
         Task { await self.refresh(account: meta, force: true) }
+        detectPlanIfNeeded(for: meta)
+    }
+
+    // MARK: - Plan detection
+
+    /// Detects the account's plan tier from the provider's profile endpoint,
+    /// feeding the quota-weighted best-account pool: once per launch per
+    /// account, only while nothing has been detected yet, and completely
+    /// silent on failure — detection must never affect usage display or
+    /// login success. The user's manual Plan choice always outranks the
+    /// result (see `AccountMeta.effectiveQuotaMultiplier`).
+    private func detectPlanIfNeeded(for account: AccountMeta) {
+        guard let current = accounts.first(where: { $0.id == account.id }),
+            current.detectedRateLimitTier == nil,
+            current.detectedQuotaMultiplier == nil,
+            !planDetectionAttempted.contains(account.id)
+        else { return }
+        planDetectionAttempted.insert(account.id)
+        Task {
+            guard let token = try? await validAccessToken(for: account),
+                let plan = ((try? await providerFactory(account.provider)
+                    .fetchProfile(accessToken: token)) ?? nil),
+                plan.rateLimitTier != nil || plan.quotaMultiplier != nil,
+                let index = accounts.firstIndex(where: { $0.id == account.id })
+            else { return }
+            accounts[index].detectedRateLimitTier = plan.rateLimitTier
+            accounts[index].detectedQuotaMultiplier = plan.quotaMultiplier
+            persistAccounts()
+        }
     }
 
     // MARK: - Refresh
@@ -337,6 +372,9 @@ final class AccountStore: ObservableObject {
             state.error = nil
             state.needsReauth = false
             cooldownUntil[account.id] = nil
+            // Opportunistic, silent, once per launch: piggyback plan-tier
+            // detection on a working token.
+            detectPlanIfNeeded(for: account)
         } catch UsageError.unauthorized {
             state.error = "Sign-in expired"
             state.needsReauth = true

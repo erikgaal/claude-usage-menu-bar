@@ -10,16 +10,28 @@ struct AccountMeta: Codable, Identifiable, Equatable {
     /// User-chosen display name ("Work", "Personal"); nil → provider name.
     var label: String?
     /// Session-quota size relative to a Pro plan (Pro ×1, Max ×5, Max ×20),
-    /// set by the user via the account's "Plan" menu — the API exposes no
-    /// tier in the responses we fetch. Nil = unknown; the best-account
-    /// ranking then assumes equal quotas for the whole provider group.
+    /// set by the user via the account's "Plan" menu. Nil = not chosen;
+    /// detection (below) fills in when it can, and the best-account ranking
+    /// assumes equal quotas for the whole provider group otherwise.
     var quotaMultiplier: Double?
+    /// Raw `organization.rate_limit_tier` from the provider's profile
+    /// endpoint (e.g. "default_claude_max_5x"), kept for display and so an
+    /// unmapped tier isn't refetched every poll. Nil = never detected.
+    var detectedRateLimitTier: String?
+    /// The multiplier mapped from `detectedRateLimitTier`; nil when the
+    /// tier is unknown or unmapped — never guessed.
+    var detectedQuotaMultiplier: Double?
 
     var displayLabel: String { label ?? provider.displayName }
 
+    /// The multiplier the ranking uses: the user's manual choice always
+    /// wins; the API-detected tier fills in otherwise.
+    var effectiveQuotaMultiplier: Double? { quotaMultiplier ?? detectedQuotaMultiplier }
+
     init(
         id: String, email: String, organizationName: String?, provider: ProviderID,
-        label: String? = nil, quotaMultiplier: Double? = nil
+        label: String? = nil, quotaMultiplier: Double? = nil,
+        detectedRateLimitTier: String? = nil, detectedQuotaMultiplier: Double? = nil
     ) {
         self.id = id
         self.email = email
@@ -27,6 +39,8 @@ struct AccountMeta: Codable, Identifiable, Equatable {
         self.provider = provider
         self.label = label
         self.quotaMultiplier = quotaMultiplier
+        self.detectedRateLimitTier = detectedRateLimitTier
+        self.detectedQuotaMultiplier = detectedQuotaMultiplier
     }
 
     // Accounts saved before multi-provider/label/plan support lack those keys.
@@ -38,7 +52,20 @@ struct AccountMeta: Codable, Identifiable, Equatable {
         provider = try container.decodeIfPresent(ProviderID.self, forKey: .provider) ?? .claude
         label = try container.decodeIfPresent(String.self, forKey: .label)
         quotaMultiplier = try container.decodeIfPresent(Double.self, forKey: .quotaMultiplier)
+        detectedRateLimitTier = try container.decodeIfPresent(
+            String.self, forKey: .detectedRateLimitTier)
+        detectedQuotaMultiplier = try container.decodeIfPresent(
+            Double.self, forKey: .detectedQuotaMultiplier)
     }
+}
+
+/// Plan info detected from a provider's profile endpoint; the nil/nil value
+/// means "endpoint answered but told us nothing usable".
+struct DetectedPlan: Equatable {
+    /// Raw tier string (e.g. "default_claude_max_5x"), kept for display.
+    let rateLimitTier: String?
+    /// Session-quota multiplier mapped from the tier; nil = unknown.
+    let quotaMultiplier: Double?
 }
 
 /// OAuth token material stored in the Keychain per account.
@@ -120,6 +147,34 @@ struct AccountDisplayState: Equatable {
 }
 
 // MARK: - Wire formats
+
+/// Response of `GET https://api.anthropic.com/api/oauth/profile`, decoded
+/// down to the plan-detection fields. `organization.rate_limit_tier` is the
+/// authoritative one; the account-level plan booleans are unreliable
+/// (observed false on an org-billed Max 5× Team account) and serve only as
+/// a last-resort Pro hint when the tier string is absent.
+struct ProfileResponse: Decodable {
+    struct Account: Decodable {
+        let hasClaudeMax: Bool?
+        let hasClaudePro: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case hasClaudeMax = "has_claude_max"
+            case hasClaudePro = "has_claude_pro"
+        }
+    }
+
+    struct Organization: Decodable {
+        let rateLimitTier: String?
+
+        enum CodingKeys: String, CodingKey {
+            case rateLimitTier = "rate_limit_tier"
+        }
+    }
+
+    let account: Account?
+    let organization: Organization?
+}
 
 /// Response of `GET https://api.anthropic.com/api/oauth/usage`.
 struct UsageResponse: Decodable {

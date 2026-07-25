@@ -114,11 +114,11 @@ enum BestAccount {
         let sessionResetsAt: Date?
         /// Raw session burn rate from history (%/hour); nil when unknown.
         let burnRate: Double?
-        /// The account's plan multiplier as supplied (Pro ×1, Max ×5/×20);
-        /// nil = not set. Whether it actually weighted the pool is the
-        /// group's `quotaWeighting` — one unknown anywhere forces the whole
-        /// group onto equal weights.
-        let quotaMultiplier: Double?
+        /// The account's plan multiplier as supplied (Pro ×1, Max ×5/×20),
+        /// with its provenance; nil = not set. Whether it actually weighted
+        /// the pool is the group's `quotaWeighting` — one unknown anywhere
+        /// forces the whole group onto equal weights.
+        let quota: Quota?
         let eligibility: Eligibility
         let pace: PaceSignal
         /// Capacity that expires unused at this account's session reset
@@ -194,6 +194,22 @@ enum BestAccount {
         case atRiskTooClose(leaderID: String, runnerUpID: String, gapUnits: Double)
     }
 
+    /// An account's plan multiplier plus its provenance, so the debug view
+    /// can distinguish "Max 5× (auto)" from a hand-picked plan. The math
+    /// treats both identically; precedence (manual wins over detected) is
+    /// resolved by the store before the data gets here.
+    struct Quota: Equatable {
+        let multiplier: Double
+        let source: Source
+
+        enum Source: Equatable {
+            /// Chosen by the user in the account's Plan menu.
+            case manual
+            /// Detected from the provider's profile endpoint.
+            case detected
+        }
+    }
+
     /// How the group's shared burn pool was weighted (issue #20 amendment).
     /// Percents aren't commensurable across plan tiers — 10%/h on a Max 20×
     /// is vastly more real usage than 10%/h on Pro — so pooled math runs in
@@ -262,7 +278,7 @@ enum BestAccount {
         states: [String: AccountDisplayState],
         sessionProjections: [String: Date] = [:],
         sessionBurnRates: [String: Double] = [:],
-        quotaMultipliers: [String: Double] = [:],
+        quotas: [String: Quota] = [:],
         now: Date = Date()
     ) -> [GroupTrace] {
         // Group by provider, preserving panel order for groups and members.
@@ -276,15 +292,16 @@ enum BestAccount {
         return order.map { provider in
             let members = groups[provider] ?? []
             // Honesty rule: the weighted pool applies only when every
-            // member's plan is known (and sane). One unknown anywhere and
-            // the whole group runs on equal weights — silently mixing known
-            // and unknown weights is worse than assuming equality.
-            let allKnown = members.allSatisfy { (quotaMultipliers[$0.id] ?? 0) > 0 }
+            // member's plan is known (and sane), whether hand-picked or
+            // detected. One unknown anywhere and the whole group runs on
+            // equal weights — silently mixing known and unknown weights is
+            // worse than assuming equality.
+            let allKnown = members.allSatisfy { (quotas[$0.id]?.multiplier ?? 0) > 0 }
             let weighting: QuotaWeighting = allKnown ? .quotaWeighted : .equalWeightsAssumed
             var effectiveMultipliers: [String: Double] = [:]
             for member in members {
                 effectiveMultipliers[member.id] =
-                    allKnown ? quotaMultipliers[member.id]! : 1
+                    allKnown ? quotas[member.id]!.multiplier : 1
             }
             // Pooled demand in quota units per hour (one full Pro window =
             // 1.0). Demand is demand no matter which account currently
@@ -300,7 +317,7 @@ enum BestAccount {
                     account: account, state: states[account.id],
                     projection: sessionProjections[account.id],
                     burnRate: sessionBurnRates[account.id],
-                    quotaMultiplier: quotaMultipliers[account.id], now: now)
+                    quota: quotas[account.id], now: now)
             }
             attachAtRisk(
                 to: &candidates, aggregatePace: aggregatePace,
@@ -325,7 +342,7 @@ enum BestAccount {
         states: [String: AccountDisplayState],
         sessionProjections: [String: Date] = [:],
         sessionBurnRates: [String: Double] = [:],
-        quotaMultipliers: [String: Double] = [:],
+        quotas: [String: Quota] = [:],
         now: Date = Date()
     ) -> [String: Badge] {
         var result: [String: Badge] = [:]
@@ -333,7 +350,7 @@ enum BestAccount {
             accounts: accounts, states: states,
             sessionProjections: sessionProjections,
             sessionBurnRates: sessionBurnRates,
-            quotaMultipliers: quotaMultipliers, now: now) {
+            quotas: quotas, now: now) {
             switch trace.decision {
             case .badged(let award):
                 result[award.badgedID] = award.badge
@@ -359,7 +376,7 @@ enum BestAccount {
         state: AccountDisplayState?,
         projection: Date?,
         burnRate: Double?,
-        quotaMultiplier: Double?,
+        quota: Quota?,
         now: Date
     ) -> CandidateTrace {
         let session = state.flatMap { sessionLimit(in: $0.limits) }
@@ -389,7 +406,7 @@ enum BestAccount {
             sessionPercent: session?.percent,
             sessionResetsAt: session?.resetsAt,
             burnRate: burnRate,
-            quotaMultiplier: quotaMultiplier,
+            quota: quota,
             eligibility: eligibility,
             pace: pace,
             atRiskUnits: nil,

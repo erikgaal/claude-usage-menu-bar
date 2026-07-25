@@ -88,11 +88,14 @@ final class BestAccountTests: XCTestCase {
         _ pairs: [(AccountMeta, AccountDisplayState?)],
         projections: [String: Date] = [:],
         rates: [String: Double] = [:],
-        multipliers: [String: Double] = [:]
+        multipliers: [String: Double] = [:],
+        detected: [String: Double] = [:]
     ) -> Set<String> {
         Set(
-            badges(pairs, projections: projections, rates: rates, multipliers: multipliers)
-                .keys)
+            badges(
+                pairs, projections: projections, rates: rates,
+                multipliers: multipliers, detected: detected
+            ).keys)
     }
 
     /// Same run, but keeping the full verdicts for tooltip assertions.
@@ -100,7 +103,8 @@ final class BestAccountTests: XCTestCase {
         _ pairs: [(AccountMeta, AccountDisplayState?)],
         projections: [String: Date] = [:],
         rates: [String: Double] = [:],
-        multipliers: [String: Double] = [:]
+        multipliers: [String: Double] = [:],
+        detected: [String: Double] = [:]
     ) -> [String: BestAccount.Badge] {
         var states: [String: AccountDisplayState] = [:]
         for (account, state) in pairs {
@@ -109,7 +113,22 @@ final class BestAccountTests: XCTestCase {
         return BestAccount.winners(
             accounts: pairs.map(\.0), states: states,
             sessionProjections: projections, sessionBurnRates: rates,
-            quotaMultipliers: multipliers, now: Self.now)
+            quotas: quotas(manual: multipliers, detected: detected), now: Self.now)
+    }
+
+    /// Builds the quota input the way `AccountStore` does: manual choices
+    /// win over detected tiers.
+    private func quotas(
+        manual: [String: Double], detected: [String: Double]
+    ) -> [String: BestAccount.Quota] {
+        var quotas: [String: BestAccount.Quota] = [:]
+        for (id, multiplier) in detected {
+            quotas[id] = BestAccount.Quota(multiplier: multiplier, source: .detected)
+        }
+        for (id, multiplier) in manual {
+            quotas[id] = BestAccount.Quota(multiplier: multiplier, source: .manual)
+        }
+        return quotas
     }
 
     // MARK: Group size
@@ -555,7 +574,8 @@ final class BestAccountTests: XCTestCase {
         _ pairs: [(AccountMeta, AccountDisplayState?)],
         projections: [String: Date] = [:],
         rates: [String: Double] = [:],
-        multipliers: [String: Double] = [:]
+        multipliers: [String: Double] = [:],
+        detected: [String: Double] = [:]
     ) -> [BestAccount.GroupTrace] {
         var states: [String: AccountDisplayState] = [:]
         for (account, state) in pairs {
@@ -564,7 +584,7 @@ final class BestAccountTests: XCTestCase {
         return BestAccount.evaluate(
             accounts: pairs.map(\.0), states: states,
             sessionProjections: projections, sessionBurnRates: rates,
-            quotaMultipliers: multipliers, now: Self.now)
+            quotas: quotas(manual: multipliers, detected: detected), now: Self.now)
     }
 
     private func candidate(
@@ -1151,8 +1171,10 @@ final class BestAccountTests: XCTestCase {
             traces(pairs, rates: rates, multipliers: ["work": 20]).first)
         XCTAssertEqual(partial.quotaWeighting, .equalWeightsAssumed)
         // The supplied multiplier is still visible per account…
-        XCTAssertEqual(candidate("work", in: partial)?.quotaMultiplier, 20)
-        XCTAssertNil(candidate("personal", in: partial)?.quotaMultiplier)
+        XCTAssertEqual(
+            candidate("work", in: partial)?.quota,
+            BestAccount.Quota(multiplier: 20, source: .manual))
+        XCTAssertNil(candidate("personal", in: partial)?.quota)
         // …but the math ran unweighted: identical to no multipliers at all.
         let unweighted = try XCTUnwrap(traces(pairs, rates: rates).first)
         XCTAssertEqual(partial.aggregatePace, unweighted.aggregatePace)
@@ -1229,5 +1251,48 @@ final class BestAccountTests: XCTestCase {
             rates: ["c": 20], multipliers: mults)
         XCTAssertEqual(Set(underMargin.keys), ["c"])
         XCTAssertNil(underMargin["c"]?.expiring)
+    }
+
+    // MARK: Detected plan tiers
+
+    func testDetectedMultipliersWeightThePool() throws {
+        // The mixed-tier example again, but every multiplier came from the
+        // profile endpoint instead of the Plan menu: detection counts as
+        // "known", so the pool is fully weighted and the verdict matches
+        // the manual-picker run exactly.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let rates = ["work": 30.0, "personal": 10.0]
+        let tiers = ["work": 20.0, "personal": 1.0]
+        let trace = try XCTUnwrap(traces(pairs, rates: rates, detected: tiers).first)
+        XCTAssertEqual(trace.quotaWeighting, .quotaWeighted)
+        XCTAssertEqual(
+            candidate("work", in: trace)?.quota,
+            BestAccount.Quota(multiplier: 20, source: .detected))
+        XCTAssertEqual(
+            badges(pairs, rates: rates, detected: tiers),
+            badges(pairs, rates: rates, multipliers: tiers),
+            "detected and manual multipliers must weight the pool identically")
+    }
+
+    func testManualAndDetectedMixCountsAsFullyKnown() throws {
+        // One account hand-picked, the other auto-detected: every account
+        // has an effective multiplier, so the honesty rule is satisfied —
+        // and the trace records each source for the debug view.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+                    (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+                ],
+                rates: ["work": 30, "personal": 10],
+                multipliers: ["work": 20],
+                detected: ["personal": 1]
+            ).first)
+        XCTAssertEqual(trace.quotaWeighting, .quotaWeighted)
+        XCTAssertEqual(candidate("work", in: trace)?.quota?.source, .manual)
+        XCTAssertEqual(candidate("personal", in: trace)?.quota?.source, .detected)
     }
 }
