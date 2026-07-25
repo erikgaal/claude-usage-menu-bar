@@ -94,6 +94,18 @@ final class AccountStore: ObservableObject {
         persistAccounts()
     }
 
+    /// Moves an account up (negative offset) or down (positive) in the list.
+    /// Array order is the single source of truth — it drives the panel, the
+    /// menu bar summary, and the persisted JSON — so this is the whole change.
+    func moveAccount(_ account: AccountMeta, by offset: Int) {
+        guard let index = accounts.firstIndex(where: { $0.id == account.id }) else { return }
+        let destination = index + offset
+        guard accounts.indices.contains(destination), destination != index else { return }
+        let moved = accounts.remove(at: index)
+        accounts.insert(moved, at: destination)
+        persistAccounts()
+    }
+
     func removeAccount(_ account: AccountMeta) {
         accounts.removeAll { $0.id == account.id }
         states[account.id] = nil
