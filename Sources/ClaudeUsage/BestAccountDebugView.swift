@@ -48,6 +48,9 @@ struct BestAccountDebugView: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
+                Text(planText(candidate))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
                 Spacer(minLength: 0)
                 if isBadged(candidate) {
                     Text("Best")
@@ -60,13 +63,25 @@ struct BestAccountDebugView: View {
                 .foregroundStyle(.secondary)
             // Expiring-capacity input (issue #19), shown whenever the group
             // has a demand signal at all — including 0, which explains why
-            // an account was passed over.
-            if trace.aggregatePace > 0, let atRisk = candidate.atRiskCapacity {
-                Text("≈\(Int(atRisk.rounded()))% at risk before reset")
+            // an account was passed over. Own-percent first, pooled units
+            // alongside so mixed tiers stay comparable.
+            if trace.aggregatePace > 0,
+                let percent = candidate.atRiskPercent,
+                let atRiskUnits = candidate.atRiskUnits {
+                Text(
+                    "≈\(Int(percent.rounded()))% at risk before reset "
+                        + "(\(units(atRiskUnits)))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func planText(_ candidate: BestAccount.CandidateTrace) -> String {
+        guard let multiplier = candidate.quotaMultiplier else { return "plan not set" }
+        let value = multiplier == multiplier.rounded()
+            ? String(Int(multiplier)) : String(format: "%.1f", multiplier)
+        return "×\(value)"
     }
 
     private func isBadged(_ candidate: BestAccount.CandidateTrace) -> Bool {
@@ -136,13 +151,13 @@ struct BestAccountDebugView: View {
             lines.append("Best: \(label(award.badgedID)).")
             return lines
         case .expiringFirst(let award):
-            var lines = [groupPaceLine]
+            var lines = poolLines
             var expiring =
-                "Expiring-first: \(label(award.badgedID)) has \(points(award.atRisk)) "
-                + "at risk (floor ≥ \(points(BestAccount.atRiskFloor)))"
-            if let gap = award.atRiskGap {
-                expiring += ", leads by \(points(gap)) "
-                    + "(needs ≥ \(points(BestAccount.atRiskMargin)))."
+                "Expiring-first: \(label(award.badgedID)) has \(units(award.atRiskUnits)) "
+                + "at risk (floor ≥ \(units(BestAccount.atRiskFloor)))"
+            if let gap = award.atRiskGapUnits {
+                expiring += ", leads by \(units(gap)) "
+                    + "(needs ≥ \(units(BestAccount.atRiskMargin)))."
             } else {
                 expiring += "."
             }
@@ -155,18 +170,18 @@ struct BestAccountDebugView: View {
     /// The expiring-capacity preamble for a v2-decided group: the demand
     /// signal and why the expiring-first path stood down.
     private var prefixLines: [String] {
-        var lines = [groupPaceLine]
+        var lines = poolLines
         switch trace.capacityFallback {
         case .noAggregatePace:
             lines.append("Expiring-first: no burn-rate data — using headroom ranking.")
-        case .belowFloor(let topAtRisk):
+        case .belowFloor(let topAtRiskUnits):
             lines.append(
-                "Expiring-first: at most \(points(topAtRisk)) at risk "
-                    + "(floor ≥ \(points(BestAccount.atRiskFloor))) — using headroom ranking.")
-        case .atRiskTooClose(let leaderID, let runnerUpID, let gap):
+                "Expiring-first: at most \(units(topAtRiskUnits)) at risk "
+                    + "(floor ≥ \(units(BestAccount.atRiskFloor))) — using headroom ranking.")
+        case .atRiskTooClose(let leaderID, let runnerUpID, let gapUnits):
             lines.append(
                 "Expiring-first: \(label(leaderID)) leads \(label(runnerUpID)) by only "
-                    + "\(points(gap)) at risk (needs ≥ \(points(BestAccount.atRiskMargin))) "
+                    + "\(units(gapUnits)) at risk (needs ≥ \(units(BestAccount.atRiskMargin))) "
                     + "— using headroom ranking.")
         case nil:
             break
@@ -174,9 +189,21 @@ struct BestAccountDebugView: View {
         return lines
     }
 
-    private var groupPaceLine: String {
-        guard trace.aggregatePace > 0 else { return "Group pace: no data." }
-        return "Group pace: \(String(format: "%.1f", trace.aggregatePace))%/h combined."
+    /// Pooled-demand summary plus the honesty annotation when plans are
+    /// missing and the pool fell back to equal weights.
+    private var poolLines: [String] {
+        var lines: [String] = []
+        if trace.aggregatePace > 0 {
+            lines.append(
+                "Pooled demand: \(units(trace.aggregatePace))/h "
+                    + "(1 unit = a full Pro session).")
+        } else {
+            lines.append("Pooled demand: no data.")
+        }
+        if trace.quotaWeighting == .equalWeightsAssumed {
+            lines.append("Plans not set — assuming equal quotas.")
+        }
+        return lines
     }
 
     private func paceLine(_ award: BestAccount.Award) -> String {
@@ -210,6 +237,11 @@ struct BestAccountDebugView: View {
 
     private func points(_ value: Double) -> String {
         String(format: "%.1f pp", value)
+    }
+
+    /// Pooled quota units (one full Pro session window = 1.0).
+    private func units(_ value: Double) -> String {
+        String(format: "%.2f units", value)
     }
 
     /// Reuses the panel's duration wording ("2h 10m") for a plain interval.

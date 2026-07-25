@@ -87,16 +87,20 @@ final class BestAccountTests: XCTestCase {
     private func winners(
         _ pairs: [(AccountMeta, AccountDisplayState?)],
         projections: [String: Date] = [:],
-        rates: [String: Double] = [:]
+        rates: [String: Double] = [:],
+        multipliers: [String: Double] = [:]
     ) -> Set<String> {
-        Set(badges(pairs, projections: projections, rates: rates).keys)
+        Set(
+            badges(pairs, projections: projections, rates: rates, multipliers: multipliers)
+                .keys)
     }
 
     /// Same run, but keeping the full verdicts for tooltip assertions.
     private func badges(
         _ pairs: [(AccountMeta, AccountDisplayState?)],
         projections: [String: Date] = [:],
-        rates: [String: Double] = [:]
+        rates: [String: Double] = [:],
+        multipliers: [String: Double] = [:]
     ) -> [String: BestAccount.Badge] {
         var states: [String: AccountDisplayState] = [:]
         for (account, state) in pairs {
@@ -104,7 +108,8 @@ final class BestAccountTests: XCTestCase {
         }
         return BestAccount.winners(
             accounts: pairs.map(\.0), states: states,
-            sessionProjections: projections, sessionBurnRates: rates, now: Self.now)
+            sessionProjections: projections, sessionBurnRates: rates,
+            quotaMultipliers: multipliers, now: Self.now)
     }
 
     // MARK: Group size
@@ -549,7 +554,8 @@ final class BestAccountTests: XCTestCase {
     private func traces(
         _ pairs: [(AccountMeta, AccountDisplayState?)],
         projections: [String: Date] = [:],
-        rates: [String: Double] = [:]
+        rates: [String: Double] = [:],
+        multipliers: [String: Double] = [:]
     ) -> [BestAccount.GroupTrace] {
         var states: [String: AccountDisplayState] = [:]
         for (account, state) in pairs {
@@ -557,7 +563,8 @@ final class BestAccountTests: XCTestCase {
         }
         return BestAccount.evaluate(
             accounts: pairs.map(\.0), states: states,
-            sessionProjections: projections, sessionBurnRates: rates, now: Self.now)
+            sessionProjections: projections, sessionBurnRates: rates,
+            quotaMultipliers: multipliers, now: Self.now)
     }
 
     private func candidate(
@@ -852,10 +859,10 @@ final class BestAccountTests: XCTestCase {
                 ],
                 rates: ["a": 35, "b": 25]
             ).first)
-        XCTAssertEqual(candidate("a", in: trace)?.atRiskCapacity, 40)
+        XCTAssertEqual(candidate("a", in: trace)?.atRiskPercent, 40)
         // b is the reserve: the demand its reset leaves uncovered lands on
         // it regardless, so nothing of b's is at risk.
-        XCTAssertEqual(candidate("b", in: trace)?.atRiskCapacity, 0)
+        XCTAssertEqual(candidate("b", in: trace)?.atRiskPercent, 0)
     }
 
     func testAtRiskCapsAtDemandBeforeReset() throws {
@@ -869,7 +876,7 @@ final class BestAccountTests: XCTestCase {
                 ],
                 rates: ["a": 60]
             ).first)
-        XCTAssertEqual(candidate("a", in: trace)?.atRiskCapacity, 30)
+        XCTAssertEqual(candidate("a", in: trace)?.atRiskPercent, 30)
         let result = badges(
             [
                 (makeAccount("a"), makeState(session: 20, resetIn: 1800)),
@@ -891,9 +898,9 @@ final class BestAccountTests: XCTestCase {
                 ],
                 rates: ["a": 20, "b": 20, "c": 20]
             ).first)
-        XCTAssertEqual(candidate("a", in: trace)?.atRiskCapacity, 0)
-        XCTAssertEqual(candidate("b", in: trace)?.atRiskCapacity, 0)
-        XCTAssertEqual(candidate("c", in: trace)?.atRiskCapacity, 40)
+        XCTAssertEqual(candidate("a", in: trace)?.atRiskPercent, 0)
+        XCTAssertEqual(candidate("b", in: trace)?.atRiskPercent, 0)
+        XCTAssertEqual(candidate("c", in: trace)?.atRiskPercent, 40)
         guard case .expiringFirst(let award) = trace.decision else {
             return XCTFail("expected expiring-first, got \(trace.decision)")
         }
@@ -925,27 +932,29 @@ final class BestAccountTests: XCTestCase {
         XCTAssertNil(underFloor["b"]?.expiring)
     }
 
-    func testAtRiskMarginBoundary() {
-        // a has 15 points at risk (45 min × 20%/h), b has 10 (30 min):
-        // a gap of exactly 5 — inclusive — moves the badge to a.
+    func testAtRiskMarginBoundary() throws {
+        // At 10%/h of pooled demand, a has 10 points at risk (1 h to reset)
+        // and b has 5 (30 min): a gap of exactly 0.05 units — inclusive —
+        // moves the badge to a.
         let atMargin = badges(
             [
-                (makeAccount("a"), makeState(session: 30, resetIn: 2700)),
+                (makeAccount("a"), makeState(session: 30, resetIn: 3600)),
                 (makeAccount("b"), makeState(session: 40, resetIn: 1800)),
             ],
-            rates: ["a": 10, "b": 10])
+            rates: ["a": 10])
         XCTAssertEqual(Set(atMargin.keys), ["a"])
-        XCTAssertEqual(atMargin["a"]?.expiring?.points, 15)
+        XCTAssertEqual(
+            try XCTUnwrap(atMargin["a"]?.expiring?.points), 10, accuracy: 1e-9)
 
-        // Stretching b's reset to 33 min lifts its at-risk to 11: the gap
-        // (4) is under the margin, so v2 decides — a still wins, but on
-        // headroom, with no expiring payload.
+        // Stretching b's reset to 33 min lifts its at-risk to 5.5 points:
+        // the gap (0.045 units) is under the margin, so v2 decides — a
+        // still wins, but on headroom, with no expiring payload.
         let underMargin = badges(
             [
-                (makeAccount("a"), makeState(session: 30, resetIn: 2700)),
+                (makeAccount("a"), makeState(session: 30, resetIn: 3600)),
                 (makeAccount("b"), makeState(session: 40, resetIn: 1980)),
             ],
-            rates: ["a": 10, "b": 10])
+            rates: ["a": 10])
         XCTAssertEqual(Set(underMargin.keys), ["a"])
         XCTAssertNil(underMargin["a"]?.expiring)
     }
@@ -963,11 +972,13 @@ final class BestAccountTests: XCTestCase {
         ]
         let rates = ["a": 30.0, "b": 20.0, "c": 10.0]
         let trace = try XCTUnwrap(traces(pairs, rates: rates).first)
-        XCTAssertNil(candidate("b", in: trace)?.atRiskCapacity)
-        XCTAssertEqual(candidate("a", in: trace)?.atRiskCapacity, 10)
+        XCTAssertNil(candidate("b", in: trace)?.atRiskPercent)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("a", in: trace)?.atRiskPercent), 10, accuracy: 1e-9)
         let result = badges(pairs, rates: rates)
         XCTAssertEqual(Set(result.keys), ["a"])
-        XCTAssertEqual(result["a"]?.expiring?.points, 10)
+        XCTAssertEqual(
+            try XCTUnwrap(result["a"]?.expiring?.points), 10, accuracy: 1e-9)
     }
 
     func testZeroAggregatePaceMatchesV2AcrossFixtures() {
@@ -997,18 +1008,23 @@ final class BestAccountTests: XCTestCase {
                 ],
                 rates: ["work": 35, "personal": 25]
             ).first)
-        XCTAssertEqual(trace.aggregatePace, 60)
-        XCTAssertEqual(candidate("work", in: trace)?.atRiskCapacity, 40)
-        XCTAssertEqual(candidate("personal", in: trace)?.atRiskCapacity, 0)
+        // 60 pp/h at equal weights pools to 0.60 units/h; Work's 40 pp at
+        // risk is 0.40 units.
+        XCTAssertEqual(trace.aggregatePace, 0.6, accuracy: 1e-12)
+        XCTAssertEqual(trace.quotaWeighting, .equalWeightsAssumed)
+        XCTAssertEqual(candidate("work", in: trace)?.atRiskPercent, 40)
+        XCTAssertEqual(try XCTUnwrap(candidate("work", in: trace)?.atRiskUnits), 0.4, accuracy: 1e-12)
+        XCTAssertEqual(candidate("personal", in: trace)?.atRiskPercent, 0)
         XCTAssertNil(trace.capacityFallback)
+        guard case .expiringFirst(let award) = trace.decision else {
+            return XCTFail("expected expiring-first, got \(trace.decision)")
+        }
+        XCTAssertEqual(award.badgedID, "work")
+        XCTAssertEqual(award.atRiskUnits, 0.4, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(award.atRiskGapUnits), 0.4, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(award.badge.expiring?.points), 40, accuracy: 1e-9)
         XCTAssertEqual(
-            trace.decision,
-            .expiringFirst(
-                BestAccount.ExpiringAward(
-                    badgedID: "work", atRisk: 40, atRiskGap: 40,
-                    badge: BestAccount.Badge(
-                        expiring: BestAccount.ExpiringCapacity(
-                            points: 40, resetsAt: Self.now.addingTimeInterval(3600))))))
+            award.badge.expiring?.resetsAt, Self.now.addingTimeInterval(3600))
     }
 
     func testTraceFallbackReasons() throws {
@@ -1033,7 +1049,7 @@ final class BestAccountTests: XCTestCase {
                 ],
                 rates: ["a": 30, "b": 30]
             ).first)
-        XCTAssertEqual(idle.capacityFallback, .belowFloor(topAtRisk: 0))
+        XCTAssertEqual(idle.capacityFallback, .belowFloor(topAtRiskUnits: 0))
 
         // Both accounts have real but near-equal at-risk: the strategies
         // tie, and the trace records who was compared and by how much.
@@ -1045,17 +1061,173 @@ final class BestAccountTests: XCTestCase {
                 ],
                 rates: ["a": 10, "b": 10]
             ).first)
-        guard case .atRiskTooClose(let leaderID, let runnerUpID, let gap) =
+        guard case .atRiskTooClose(let leaderID, let runnerUpID, let gapUnits) =
             close.capacityFallback
         else {
             return XCTFail("expected atRiskTooClose, got \(String(describing: close.capacityFallback))")
         }
         XCTAssertEqual(leaderID, "a")
         XCTAssertEqual(runnerUpID, "b")
-        XCTAssertEqual(gap, 4, accuracy: 1e-9)
+        // 4 pp at equal weights = 0.04 units.
+        XCTAssertEqual(gapUnits, 0.04, accuracy: 1e-9)
         guard case .badged(let award) = close.decision else {
             return XCTFail("expected a v2 badge, got \(close.decision)")
         }
         XCTAssertEqual(award.badgedID, "a")
+    }
+
+    // MARK: Quota-weighted shared pool
+
+    func testUnitConversionMixedTiers() throws {
+        // Hand-computed mixed-tier example. Work is Max 20× at 60% session
+        // (40% headroom = 8.0 units), resets in 1 h; Personal is Pro at 30%
+        // (70% headroom = 0.7 units), resets in 4 h. Rates: Work 30 pp/h ×20
+        // = 6.0 units/h, Personal 10 pp/h ×1 = 0.1 → pool 6.1 units/h.
+        // Work: demand 6.1, savable min(8, 6.1) = 6.1, coverage 0.7 →
+        // inevitable 5.4 → at-risk 0.7 units = 3.5% of its own window.
+        // Personal: savable 0.7, all inevitable → 0. Badge Work.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let rates = ["work": 30.0, "personal": 10.0]
+        let mults = ["work": 20.0, "personal": 1.0]
+        let trace = try XCTUnwrap(traces(pairs, rates: rates, multipliers: mults).first)
+        XCTAssertEqual(trace.quotaWeighting, .quotaWeighted)
+        XCTAssertEqual(trace.aggregatePace, 6.1, accuracy: 1e-12)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("work", in: trace)?.atRiskUnits), 0.7, accuracy: 1e-9)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("work", in: trace)?.atRiskPercent), 3.5, accuracy: 1e-9)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("personal", in: trace)?.atRiskUnits), 0, accuracy: 1e-9)
+        let result = badges(pairs, rates: rates, multipliers: mults)
+        XCTAssertEqual(Set(result.keys), ["work"])
+        XCTAssertEqual(try XCTUnwrap(result["work"]?.expiring?.points), 3.5, accuracy: 1e-9)
+    }
+
+    func testPoolStabilityAcrossAccountSizes() throws {
+        // The same absolute workload must pool identically whether it shows
+        // up as a fast percent-burn on a small account or a slow one on a
+        // big account: 60 pp/h on Pro == 3 pp/h on Max 20× == 0.6 units/h.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("big"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("small"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let mults = ["big": 20.0, "small": 1.0]
+        let onSmall = try XCTUnwrap(
+            traces(pairs, rates: ["small": 60], multipliers: mults).first)
+        let onBig = try XCTUnwrap(
+            traces(pairs, rates: ["big": 3], multipliers: mults).first)
+        XCTAssertEqual(onSmall.aggregatePace, 0.6, accuracy: 1e-12)
+        XCTAssertEqual(onBig.aggregatePace, onSmall.aggregatePace)
+    }
+
+    func testUnknownMultiplierFallsBackToEqualWeights() {
+        // Honesty rule, property-style: setting every multiplier except the
+        // first account's must reproduce the all-unknown verdict bit for
+        // bit — silently mixing known and unknown weights is worse than
+        // assuming equality.
+        for (pairs, projections, rates) in derivationFixtures() {
+            let baseline = badges(pairs, projections: projections, rates: rates)
+            var partial: [String: Double] = [:]
+            for (account, _) in pairs.dropFirst() { partial[account.id] = 20 }
+            XCTAssertEqual(
+                badges(pairs, projections: projections, rates: rates, multipliers: partial),
+                baseline,
+                "one unknown plan must force the whole group onto equal weights")
+        }
+    }
+
+    func testUnknownMultiplierIsAnnotatedInTrace() throws {
+        // The debug view must be able to say "plans not set — assuming
+        // equal quotas" whenever the honesty rule downgraded the pool.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let rates = ["work": 35.0, "personal": 25.0]
+        let partial = try XCTUnwrap(
+            traces(pairs, rates: rates, multipliers: ["work": 20]).first)
+        XCTAssertEqual(partial.quotaWeighting, .equalWeightsAssumed)
+        // The supplied multiplier is still visible per account…
+        XCTAssertEqual(candidate("work", in: partial)?.quotaMultiplier, 20)
+        XCTAssertNil(candidate("personal", in: partial)?.quotaMultiplier)
+        // …but the math ran unweighted: identical to no multipliers at all.
+        let unweighted = try XCTUnwrap(traces(pairs, rates: rates).first)
+        XCTAssertEqual(partial.aggregatePace, unweighted.aggregatePace)
+        XCTAssertEqual(partial.decision, unweighted.decision)
+    }
+
+    func testAllKnownVersusAllUnknownBoundary() throws {
+        // All-known ×1 runs the weighted pool (same numbers as equal
+        // weights, different annotation); all-unknown assumes equality.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let rates = ["work": 35.0, "personal": 25.0]
+        let known = try XCTUnwrap(
+            traces(pairs, rates: rates, multipliers: ["work": 1, "personal": 1]).first)
+        let unknown = try XCTUnwrap(traces(pairs, rates: rates).first)
+        XCTAssertEqual(known.quotaWeighting, .quotaWeighted)
+        XCTAssertEqual(unknown.quotaWeighting, .equalWeightsAssumed)
+        XCTAssertEqual(known.decision, unknown.decision)
+    }
+
+    func testAtRiskFloorBoundaryInUnits() {
+        // On a Max 20× account, a quarter percent of window is 0.05 units —
+        // exactly the floor, so expiring-first fires even though the
+        // percent numbers look negligible; a whisker less falls back to v2
+        // (which badges idle b on headroom, 10% vs 20% session... margin 10).
+        let mults = ["a": 20.0, "b": 20.0]
+        let atFloor = badges(
+            [
+                // 1 pp/h × 20 = 0.2 units/h; 15 min to reset → 0.05 units.
+                (makeAccount("a"), makeState(session: 20, resetIn: 900)),
+                (makeAccount("b"), makeIdleSessionState(session: 10)),
+            ],
+            rates: ["a": 1], multipliers: mults)
+        XCTAssertEqual(Set(atFloor.keys), ["a"])
+        XCTAssertNotNil(atFloor["a"]?.expiring)
+
+        let underFloor = badges(
+            [
+                (makeAccount("a"), makeState(session: 20, resetIn: 840)),
+                (makeAccount("b"), makeIdleSessionState(session: 10)),
+            ],
+            rates: ["a": 1], multipliers: mults)
+        XCTAssertEqual(Set(underFloor.keys), ["b"])
+        XCTAssertNil(underFloor["b"]?.expiring)
+    }
+
+    func testAtRiskMarginBoundaryAcrossTiers() {
+        // Mixed tiers, demand from a third idle account: a (Pro) has
+        // 0.10 units at risk (30 min × 0.2 units/h), b (Max 5×) has 0.05 —
+        // a gap of exactly 0.05 units moves the badge to a...
+        let mults = ["a": 1.0, "b": 5.0, "c": 1.0]
+        let atMargin = badges(
+            [
+                (makeAccount("a"), makeState(session: 50, resetIn: 1800)),
+                // 0.05 units before b's reset is 1% of its ×5 window.
+                (makeAccount("b"), makeState(session: 60, resetIn: 900)),
+                (makeAccount("c"), makeIdleSessionState(session: 0)),
+            ],
+            rates: ["c": 20], multipliers: mults)
+        XCTAssertEqual(Set(atMargin.keys), ["a"])
+        XCTAssertEqual(atMargin["a"]?.expiring?.points, 10)
+
+        // …while stretching b's reset to 18 min (0.06 units) shrinks the
+        // gap to 0.04: under the margin, v2 decides (idle c wins on
+        // headroom), with the tie recorded in the trace.
+        let underMargin = badges(
+            [
+                (makeAccount("a"), makeState(session: 50, resetIn: 1800)),
+                (makeAccount("b"), makeState(session: 60, resetIn: 1080)),
+                (makeAccount("c"), makeIdleSessionState(session: 0)),
+            ],
+            rates: ["c": 20], multipliers: mults)
+        XCTAssertEqual(Set(underMargin.keys), ["c"])
+        XCTAssertNil(underMargin["c"]?.expiring)
     }
 }

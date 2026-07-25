@@ -29,16 +29,17 @@ enum BestAccount {
     /// `margin`.
     static let overrideMargin: TimeInterval = 30 * 60
     /// The expiring-first path (issue #19) only acts when at least this much
-    /// capacity, in percentage points of a session window, is at risk of
-    /// expiring unused. Below it nothing meaningful is at stake and the v2
-    /// headroom ranking gives better advice.
-    static let atRiskFloor = 5.0
-    /// Anti-flap margin for the expiring-first path, in percentage points of
-    /// at-risk capacity: the leader must beat the runner-up by at least this
-    /// much or the verdict falls back to v2. At-risk numbers wobble with
-    /// every poll (pace refits, the reset clock ticks down), and near-ties
-    /// mean the strategies are equivalent anyway. Inclusive, like `margin`.
-    static let atRiskMargin = 5.0
+    /// capacity is at risk of expiring unused, in pooled quota units — one
+    /// full Pro session window is 1.0, so 0.05 is five Pro-percent points
+    /// (or a quarter-point of a Max 20× window). Below it nothing meaningful
+    /// is at stake and the v2 headroom ranking gives better advice.
+    static let atRiskFloor = 0.05
+    /// Anti-flap margin for the expiring-first path, in the same pooled
+    /// quota units: the leader must beat the runner-up by at least this much
+    /// or the verdict falls back to v2. At-risk numbers wobble with every
+    /// poll (pace refits, the reset clock ticks down), and near-ties mean
+    /// the strategies are equivalent anyway. Inclusive, like `margin`.
+    static let atRiskMargin = 0.05
 
     // MARK: - Badge
 
@@ -113,14 +114,21 @@ enum BestAccount {
         let sessionResetsAt: Date?
         /// Raw session burn rate from history (%/hour); nil when unknown.
         let burnRate: Double?
+        /// The account's plan multiplier as supplied (Pro ×1, Max ×5/×20);
+        /// nil = not set. Whether it actually weighted the pool is the
+        /// group's `quotaWeighting` — one unknown anywhere forces the whole
+        /// group onto equal weights.
+        let quotaMultiplier: Double?
         let eligibility: Eligibility
         let pace: PaceSignal
-        /// Capacity (percentage points) that expires unused at this
-        /// account's session reset unless the user burns it first — see
-        /// `atRiskCapacity(headroom:resetsAt:aggregatePace:coverage:now:)`.
-        /// Nil for vetoed candidates: they don't take part in the
-        /// expiring-first ranking.
-        var atRiskCapacity: Double?
+        /// Capacity that expires unused at this account's session reset
+        /// unless the user burns it first, in pooled quota units (one full
+        /// Pro window = 1.0) — see `atRiskCapacity(...)`. Nil for vetoed
+        /// candidates: they don't take part in the expiring-first ranking.
+        var atRiskUnits: Double?
+        /// The same at-risk expressed in this account's own window percent
+        /// (units × 100 ÷ effective multiplier), for display.
+        var atRiskPercent: Double?
     }
 
     /// How the pace-override leg compared the headroom winner to its
@@ -163,13 +171,13 @@ enum BestAccount {
     /// A badge was awarded on the expiring-first path (issue #19).
     struct ExpiringAward: Equatable {
         let badgedID: String
-        /// The badged account's at-risk capacity, in percentage points.
-        let atRisk: Double
-        /// Lead over the runner-up's at-risk capacity; nil when the badged
-        /// account is the sole eligible candidate (unreachable today — a
-        /// sole account has zero at-risk, see `atRiskCapacity` — but kept
-        /// honest rather than force-unwrapped).
-        let atRiskGap: Double?
+        /// The badged account's at-risk capacity, in pooled quota units.
+        let atRiskUnits: Double
+        /// Lead over the runner-up's at-risk capacity, in units; nil when
+        /// the badged account is the sole eligible candidate (unreachable
+        /// today — a sole account has zero at-risk, see `atRiskCapacity` —
+        /// but kept honest rather than force-unwrapped).
+        let atRiskGapUnits: Double?
         /// Tooltip payload for the badged account.
         let badge: Badge
     }
@@ -180,10 +188,25 @@ enum BestAccount {
         case noAggregatePace
         /// The largest at-risk capacity is under `atRiskFloor`: nothing
         /// meaningful is at stake (idle day, aligned resets, ample time).
-        case belowFloor(topAtRisk: Double)
+        case belowFloor(topAtRiskUnits: Double)
         /// The top two at-risk values are within `atRiskMargin` of each
         /// other: the strategies tie, so the steadier v2 verdict applies.
-        case atRiskTooClose(leaderID: String, runnerUpID: String, gap: Double)
+        case atRiskTooClose(leaderID: String, runnerUpID: String, gapUnits: Double)
+    }
+
+    /// How the group's shared burn pool was weighted (issue #20 amendment).
+    /// Percents aren't commensurable across plan tiers — 10%/h on a Max 20×
+    /// is vastly more real usage than 10%/h on Pro — so pooled math runs in
+    /// quota units whenever it honestly can.
+    enum QuotaWeighting: Equatable {
+        /// Every account in the group has a known plan multiplier: rates
+        /// and headroom are pooled in comparable quota units.
+        case quotaWeighted
+        /// At least one account's plan is unknown (or invalid). Mixing
+        /// known and unknown weights would silently distort the pool, so
+        /// the whole group uses equal weights — exactly the unweighted
+        /// math. The debug view surfaces this.
+        case equalWeightsAssumed
     }
 
     /// A provider group's verdict.
@@ -207,10 +230,15 @@ enum BestAccount {
         let provider: ProviderID
         /// All of the provider's accounts, in panel order.
         let candidates: [CandidateTrace]
-        /// Sum of the group's session burn rates (%/hour, negatives clamped
-        /// to zero): the total demand that could be redirected between the
-        /// group's accounts. Zero means no history signal anywhere.
+        /// Pooled demand: the sum of the group's session burn rates in
+        /// quota units per hour (rate %/h × multiplier ÷ 100, negatives
+        /// clamped to zero) — the total consumption that could be
+        /// redirected between the group's accounts. Zero means no history
+        /// signal anywhere.
         let aggregatePace: Double
+        /// Whether the pool ran on real plan multipliers or assumed equal
+        /// quotas because at least one plan is unknown.
+        let quotaWeighting: QuotaWeighting
         /// Set when the group got as far as ranking but the expiring-first
         /// path stood down; nil when it decided (or when the group never
         /// ranked at all — too small / all vetoed).
@@ -234,6 +262,7 @@ enum BestAccount {
         states: [String: AccountDisplayState],
         sessionProjections: [String: Date] = [:],
         sessionBurnRates: [String: Double] = [:],
+        quotaMultipliers: [String: Double] = [:],
         now: Date = Date()
     ) -> [GroupTrace] {
         // Group by provider, preserving panel order for groups and members.
@@ -246,26 +275,43 @@ enum BestAccount {
 
         return order.map { provider in
             let members = groups[provider] ?? []
-            // Demand is demand no matter which account currently absorbs it
-            // (even a vetoed account's traffic gets redirected somewhere
-            // usable), so every member's rate counts. Negative slopes are
-            // regression jitter on flat usage, clamped to zero.
+            // Honesty rule: the weighted pool applies only when every
+            // member's plan is known (and sane). One unknown anywhere and
+            // the whole group runs on equal weights — silently mixing known
+            // and unknown weights is worse than assuming equality.
+            let allKnown = members.allSatisfy { (quotaMultipliers[$0.id] ?? 0) > 0 }
+            let weighting: QuotaWeighting = allKnown ? .quotaWeighted : .equalWeightsAssumed
+            var effectiveMultipliers: [String: Double] = [:]
+            for member in members {
+                effectiveMultipliers[member.id] =
+                    allKnown ? quotaMultipliers[member.id]! : 1
+            }
+            // Pooled demand in quota units per hour (one full Pro window =
+            // 1.0). Demand is demand no matter which account currently
+            // absorbs it (even a vetoed account's traffic gets redirected
+            // somewhere usable), so every member's rate counts. Negative
+            // slopes are regression jitter on flat usage, clamped to zero.
             let aggregatePace = members.reduce(0.0) {
                 $0 + max(0, sessionBurnRates[$1.id] ?? 0)
+                    * (effectiveMultipliers[$1.id] ?? 1) / 100
             }
             var candidates = members.map { account in
                 candidateTrace(
                     account: account, state: states[account.id],
                     projection: sessionProjections[account.id],
-                    burnRate: sessionBurnRates[account.id], now: now)
+                    burnRate: sessionBurnRates[account.id],
+                    quotaMultiplier: quotaMultipliers[account.id], now: now)
             }
-            attachAtRisk(to: &candidates, aggregatePace: aggregatePace, now: now)
+            attachAtRisk(
+                to: &candidates, aggregatePace: aggregatePace,
+                effectiveMultipliers: effectiveMultipliers, now: now)
             let (decision, fallback) = decision(
                 for: candidates, groupSize: members.count, aggregatePace: aggregatePace)
             return GroupTrace(
                 provider: provider,
                 candidates: candidates,
                 aggregatePace: aggregatePace,
+                quotaWeighting: weighting,
                 capacityFallback: fallback,
                 decision: decision)
         }
@@ -279,13 +325,15 @@ enum BestAccount {
         states: [String: AccountDisplayState],
         sessionProjections: [String: Date] = [:],
         sessionBurnRates: [String: Double] = [:],
+        quotaMultipliers: [String: Double] = [:],
         now: Date = Date()
     ) -> [String: Badge] {
         var result: [String: Badge] = [:]
         for trace in evaluate(
             accounts: accounts, states: states,
             sessionProjections: sessionProjections,
-            sessionBurnRates: sessionBurnRates, now: now) {
+            sessionBurnRates: sessionBurnRates,
+            quotaMultipliers: quotaMultipliers, now: now) {
             switch trace.decision {
             case .badged(let award):
                 result[award.badgedID] = award.badge
@@ -311,6 +359,7 @@ enum BestAccount {
         state: AccountDisplayState?,
         projection: Date?,
         burnRate: Double?,
+        quotaMultiplier: Double?,
         now: Date
     ) -> CandidateTrace {
         let session = state.flatMap { sessionLimit(in: $0.limits) }
@@ -340,37 +389,49 @@ enum BestAccount {
             sessionPercent: session?.percent,
             sessionResetsAt: session?.resetsAt,
             burnRate: burnRate,
+            quotaMultiplier: quotaMultiplier,
             eligibility: eligibility,
             pace: pace,
-            atRiskCapacity: nil)
+            atRiskUnits: nil,
+            atRiskPercent: nil)
     }
 
-    /// Computes each eligible candidate's at-risk capacity in place. The
-    /// coverage term is the *other* eligible accounts' combined session
-    /// headroom — the capacity that could absorb the group's demand instead.
+    /// Computes each eligible candidate's at-risk capacity in place, in
+    /// pooled quota units (headroom% × multiplier ÷ 100). The coverage term
+    /// is the *other* eligible accounts' combined session headroom in the
+    /// same units — the capacity that could absorb the group's demand
+    /// instead. The own-percent mirror is stored alongside for display.
     private static func attachAtRisk(
-        to candidates: inout [CandidateTrace], aggregatePace: Double, now: Date
+        to candidates: inout [CandidateTrace], aggregatePace: Double,
+        effectiveMultipliers: [String: Double], now: Date
     ) {
-        let eligible: [(index: Int, headroom: Double)] = candidates.indices.compactMap {
+        let eligible: [(index: Int, headroomUnits: Double)] = candidates.indices.compactMap {
             index in
             guard candidates[index].eligibility == .eligible,
                 let percent = candidates[index].sessionPercent
             else { return nil }
-            return (index, max(0, 100 - percent))
+            let multiplier = effectiveMultipliers[candidates[index].accountID] ?? 1
+            return (index, max(0, 100 - percent) * multiplier / 100)
         }
-        let totalHeadroom = eligible.reduce(0.0) { $0 + $1.headroom }
-        for (index, headroom) in eligible {
-            candidates[index].atRiskCapacity = atRiskCapacity(
-                headroom: headroom,
+        let totalHeadroom = eligible.reduce(0.0) { $0 + $1.headroomUnits }
+        for (index, headroomUnits) in eligible {
+            let multiplier = effectiveMultipliers[candidates[index].accountID] ?? 1
+            let units = atRiskCapacity(
+                headroom: headroomUnits,
                 resetsAt: candidates[index].sessionResetsAt,
                 aggregatePace: aggregatePace,
-                coverage: totalHeadroom - headroom,
+                coverage: totalHeadroom - headroomUnits,
                 now: now)
+            candidates[index].atRiskUnits = units
+            candidates[index].atRiskPercent = units * 100 / multiplier
         }
     }
 
     /// Capacity that will vanish unused at this account's session reset
-    /// unless the user burns this account first (issue #19).
+    /// unless the user burns this account first (issue #19). All quantities
+    /// are in pooled quota units (one full Pro window = 1.0) so that
+    /// different plan tiers pool honestly; with equal weights the math
+    /// degrades to plain percents ÷ 100.
     ///
     /// Of the group's demand before the reset (`aggregatePace × hours`),
     /// this account can absorb at most its own headroom — that much is
@@ -423,30 +484,31 @@ enum BestAccount {
         } else {
             // Largest at-risk first; ties keep the headroom order.
             let byRisk = ranked.sorted {
-                ($0.atRiskCapacity ?? 0) > ($1.atRiskCapacity ?? 0)
+                ($0.atRiskUnits ?? 0) > ($1.atRiskUnits ?? 0)
             }
             let leader = byRisk[0]
-            let leaderRisk = leader.atRiskCapacity ?? 0
-            let runnerUpRisk = byRisk.count >= 2 ? (byRisk[1].atRiskCapacity ?? 0) : nil
+            let leaderRisk = leader.atRiskUnits ?? 0
+            let runnerUpRisk = byRisk.count >= 2 ? (byRisk[1].atRiskUnits ?? 0) : nil
             if leaderRisk < atRiskFloor {
-                fallback = .belowFloor(topAtRisk: leaderRisk)
+                fallback = .belowFloor(topAtRiskUnits: leaderRisk)
             } else if let runnerUpRisk, leaderRisk - runnerUpRisk < atRiskMargin {
                 fallback = .atRiskTooClose(
                     leaderID: leader.accountID,
                     runnerUpID: byRisk[1].accountID,
-                    gap: leaderRisk - runnerUpRisk)
+                    gapUnits: leaderRisk - runnerUpRisk)
             } else if let resetsAt = leader.sessionResetsAt {
                 let award = ExpiringAward(
                     badgedID: leader.accountID,
-                    atRisk: leaderRisk,
-                    atRiskGap: runnerUpRisk.map { leaderRisk - $0 },
+                    atRiskUnits: leaderRisk,
+                    atRiskGapUnits: runnerUpRisk.map { leaderRisk - $0 },
                     badge: Badge(
                         expiring: ExpiringCapacity(
-                            points: leaderRisk, resetsAt: resetsAt)))
+                            // The tooltip speaks the account's own percent.
+                            points: leader.atRiskPercent ?? 0, resetsAt: resetsAt)))
                 return (.expiringFirst(award), nil)
             } else {
                 // Unreachable: positive at-risk implies a live future reset.
-                fallback = .belowFloor(topAtRisk: leaderRisk)
+                fallback = .belowFloor(topAtRiskUnits: leaderRisk)
             }
         }
 

@@ -9,21 +9,27 @@ struct AccountMeta: Codable, Identifiable, Equatable {
     var provider: ProviderID
     /// User-chosen display name ("Work", "Personal"); nil → provider name.
     var label: String?
+    /// Session-quota size relative to a Pro plan (Pro ×1, Max ×5, Max ×20),
+    /// set by the user via the account's "Plan" menu — the API exposes no
+    /// tier in the responses we fetch. Nil = unknown; the best-account
+    /// ranking then assumes equal quotas for the whole provider group.
+    var quotaMultiplier: Double?
 
     var displayLabel: String { label ?? provider.displayName }
 
     init(
         id: String, email: String, organizationName: String?, provider: ProviderID,
-        label: String? = nil
+        label: String? = nil, quotaMultiplier: Double? = nil
     ) {
         self.id = id
         self.email = email
         self.organizationName = organizationName
         self.provider = provider
         self.label = label
+        self.quotaMultiplier = quotaMultiplier
     }
 
-    // Accounts saved before multi-provider/label support lack those keys.
+    // Accounts saved before multi-provider/label/plan support lack those keys.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
@@ -31,6 +37,7 @@ struct AccountMeta: Codable, Identifiable, Equatable {
         organizationName = try container.decodeIfPresent(String.self, forKey: .organizationName)
         provider = try container.decodeIfPresent(ProviderID.self, forKey: .provider) ?? .claude
         label = try container.decodeIfPresent(String.self, forKey: .label)
+        quotaMultiplier = try container.decodeIfPresent(Double.self, forKey: .quotaMultiplier)
     }
 }
 

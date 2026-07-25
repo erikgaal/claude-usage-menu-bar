@@ -630,7 +630,8 @@ final class AccountStoreTests: XCTestCase {
     }
 
     func testLegacyAccountsDecodeWithClaudeProviderAndNoLabel() {
-        // Accounts saved before multi-provider/label support lack those keys.
+        // Accounts saved before multi-provider/label/plan support lack
+        // those keys.
         let defaults = makeDefaults()
         let legacyJSON = #"[{"id":"legacy","email":"old@example.com"}]"#
         defaults.set(Data(legacyJSON.utf8), forKey: "accounts")
@@ -640,7 +641,28 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(harness.store.accounts.map(\.id), ["legacy"])
         XCTAssertEqual(harness.store.accounts.first?.provider, .claude)
         XCTAssertNil(harness.store.accounts.first?.label)
+        XCTAssertNil(harness.store.accounts.first?.quotaMultiplier)
         XCTAssertEqual(harness.store.accounts.first?.displayLabel, "Claude")
+    }
+
+    func testQuotaMultiplierPersistsAndRoundTrips() throws {
+        // Setting a plan writes it through the same persistence the account
+        // list uses; a fresh store over the same defaults sees it, and
+        // clearing it back to "not set" round-trips as nil.
+        let defaults = makeDefaults()
+        let account = makeAccount()
+        let harness = makeHarness(accounts: [account], defaults: defaults)
+
+        harness.store.setQuotaMultiplier(account, to: 20)
+        XCTAssertEqual(harness.store.accounts.first?.quotaMultiplier, 20)
+        XCTAssertEqual(try decodedAccounts(in: defaults).first?.quotaMultiplier, 20)
+
+        let reloaded = makeHarness(defaults: defaults)
+        XCTAssertEqual(reloaded.store.accounts.first?.quotaMultiplier, 20)
+
+        reloaded.store.setQuotaMultiplier(account, to: nil)
+        XCTAssertNil(reloaded.store.accounts.first?.quotaMultiplier)
+        XCTAssertNil(try decodedAccounts(in: defaults).first?.quotaMultiplier)
     }
 
     // MARK: Menu bar summary

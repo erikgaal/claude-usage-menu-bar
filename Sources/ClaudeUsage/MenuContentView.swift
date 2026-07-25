@@ -205,6 +205,17 @@ struct AccountSection: View {
         store.accounts.filter { $0.provider == account.provider }.count >= 2
     }
 
+    /// The account's plan multiplier, read live from the store (the section
+    /// holds an immutable `account` snapshot) and written through it.
+    private var quotaMultiplierBinding: Binding<Double?> {
+        Binding(
+            get: {
+                store.accounts.first { $0.id == account.id }?.quotaMultiplier
+            },
+            set: { store.setQuotaMultiplier(account, to: $0) }
+        )
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             titleRow
@@ -246,6 +257,17 @@ struct AccountSection: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Rename…") { startRenaming() }
+            // Plan tiers weight the shared burn pool behind the "Best"
+            // badge. Claude only: Codex tier ratios aren't reliably known,
+            // so those accounts stay "not set" (equal-weight pooling).
+            if account.provider == .claude {
+                Picker("Plan", selection: quotaMultiplierBinding) {
+                    Text("Pro (×1)").tag(Optional(1.0))
+                    Text("Max 5× (×5)").tag(Optional(5.0))
+                    Text("Max 20× (×20)").tag(Optional(20.0))
+                    Text("Not set").tag(Optional<Double>.none)
+                }
+            }
             if hasProviderPeers {
                 Button("Best-account details…") { showsBestDetails = true }
             }

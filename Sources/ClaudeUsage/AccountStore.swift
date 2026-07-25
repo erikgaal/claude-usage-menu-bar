@@ -116,7 +116,8 @@ final class AccountStore: ObservableObject {
         BestAccount.winners(
             accounts: accounts, states: states,
             sessionProjections: sessionProjections,
-            sessionBurnRates: sessionBurnRates, now: Date())
+            sessionBurnRates: sessionBurnRates,
+            quotaMultipliers: quotaMultipliers, now: Date())
     }
 
     /// The full evaluation behind the badge for one provider's account
@@ -127,8 +128,22 @@ final class AccountStore: ObservableObject {
         BestAccount.evaluate(
             accounts: accounts, states: states,
             sessionProjections: sessionProjections,
-            sessionBurnRates: sessionBurnRates, now: Date()
+            sessionBurnRates: sessionBurnRates,
+            quotaMultipliers: quotaMultipliers, now: Date()
         ).first { $0.provider == provider }
+    }
+
+    /// User-declared plan multipliers, keyed by account id; accounts with
+    /// no plan set are simply absent (the ranking then assumes equal quotas
+    /// for that whole provider group).
+    private var quotaMultipliers: [String: Double] {
+        var multipliers: [String: Double] = [:]
+        for account in accounts {
+            if let multiplier = account.quotaMultiplier {
+                multipliers[account.id] = multiplier
+            }
+        }
+        return multipliers
     }
 
     /// Projected session-window exhaustion per account id, from recorded
@@ -192,6 +207,15 @@ final class AccountStore: ObservableObject {
         guard let index = accounts.firstIndex(where: { $0.id == account.id }) else { return }
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         accounts[index].label = trimmed.isEmpty ? nil : trimmed
+        persistAccounts()
+    }
+
+    /// Sets the account's plan multiplier (Pro ×1, Max ×5/×20; nil = not
+    /// set), which weights the shared burn pool behind the best-account
+    /// hint. Persisted with the account metadata.
+    func setQuotaMultiplier(_ account: AccountMeta, to multiplier: Double?) {
+        guard let index = accounts.firstIndex(where: { $0.id == account.id }) else { return }
+        accounts[index].quotaMultiplier = multiplier
         persistAccounts()
     }
 
