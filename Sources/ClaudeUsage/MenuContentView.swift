@@ -238,6 +238,9 @@ struct AccountSection: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 0)
+            if store.bestAccountIDs.contains(account.id) {
+                BestBetBadge()
+            }
         }
     }
 
@@ -325,6 +328,21 @@ struct AccountSection: View {
 }
 
 // MARK: - Building blocks
+
+/// Quiet "use this one" capsule for the same-provider account with the most
+/// session headroom (see `AccountStore.bestAccountIDs`). Styled as a hint,
+/// not an alarm: small type, soft tint, no icon.
+struct BestBetBadge: View {
+    var body: some View {
+        Text("Best bet")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.green)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(Color.green.opacity(0.15)))
+            .help("Most session headroom right now")
+    }
+}
 
 struct ProviderBadge: View {
     let provider: ProviderID
