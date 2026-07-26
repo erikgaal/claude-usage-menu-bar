@@ -35,10 +35,29 @@ struct AccountMeta: Codable, Identifiable, Equatable {
 }
 
 /// OAuth token material stored in the Keychain per account.
-struct StoredTokens: Codable {
+struct StoredTokens: Codable, Sendable, Equatable {
     var accessToken: String
     var refreshToken: String
     var expiresAt: Date
+    /// What the authorization server actually granted, when it says so.
+    ///
+    /// Recorded rather than assumed from `OAuthConfig.scopes`, because a token
+    /// keeps the scopes it was minted with for life: tokens issued before that
+    /// list grew still carry the old, narrower set. Handing one to Claude Code
+    /// with a `scopes` field copied from the current constant would advertise
+    /// capabilities the token doesn't have. Nil for tokens stored before this
+    /// was tracked.
+    var scopes: [String]?
+
+    init(
+        accessToken: String, refreshToken: String, expiresAt: Date,
+        scopes: [String]? = nil
+    ) {
+        self.accessToken = accessToken
+        self.refreshToken = refreshToken
+        self.expiresAt = expiresAt
+        self.scopes = scopes
+    }
 }
 
 /// One rate-limit window as displayed in the UI.
@@ -236,9 +255,19 @@ struct TokenResponse: Decodable {
     let expiresIn: Double?
     let account: Account?
     let organization: Organization?
+    /// Space-separated per RFC 6749. Present when the server narrows what was
+    /// asked for; absent means "as requested".
+    let scope: String?
+
+    /// The granted scopes, falling back to what was requested when the server
+    /// stays silent.
+    var grantedScopes: [String] {
+        guard let scope, !scope.isEmpty else { return OAuthConfig.scopes }
+        return scope.split(separator: " ").map(String.init)
+    }
 
     enum CodingKeys: String, CodingKey {
-        case account, organization
+        case account, organization, scope
         case accessToken = "access_token"
         case refreshToken = "refresh_token"
         case expiresIn = "expires_in"

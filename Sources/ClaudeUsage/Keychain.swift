@@ -42,6 +42,13 @@ enum Keychain {
     /// so unlocking the app costs at most one Keychain prompt.
     static let vaultAccount = "oauth-tokens"
 
+    /// This app's own items only — neither this nor `load` takes a `service`,
+    /// so neither can be aimed at another application's item.
+    ///
+    /// That restriction is the point. Touching a foreign item through these
+    /// APIs rewrites its partition list to this app's `teamid:` and costs the
+    /// owner its silent access; `SecurityCLI` exists for that case and goes
+    /// through `/usr/bin/security` instead.
     static func save(_ data: Data, account: String) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

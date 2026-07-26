@@ -77,7 +77,13 @@ final class OAuthTests: XCTestCase {
         XCTAssertEqual(query["client_id"], OAuthConfig.clientID)
         XCTAssertEqual(query["response_type"], "code")
         XCTAssertEqual(query["redirect_uri"], "http://localhost:54545/callback")
-        XCTAssertEqual(query["scope"], "org:create_api_key user:profile user:inference")
+        // Spelled out rather than derived from OAuthConfig, so narrowing the
+        // list fails here instead of silently downgrading what a switched-in
+        // Claude Code session can do. Matches `claude auth login` exactly.
+        XCTAssertEqual(
+            query["scope"],
+            "org:create_api_key user:profile user:inference "
+                + "user:sessions:claude_code user:mcp_servers user:file_upload")
         XCTAssertEqual(query["code_challenge"], "the-challenge")
         XCTAssertEqual(query["code_challenge_method"], "S256")
         XCTAssertEqual(query["state"], "the-state")

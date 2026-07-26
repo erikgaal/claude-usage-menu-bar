@@ -4,11 +4,18 @@ enum UsageError: LocalizedError {
     case unauthorized
     case rateLimited(until: Date)
     case http(Int, String)
+    /// Claude Code owns this account's token chain and its store couldn't be
+    /// read this time. Deliberately *not* `.unauthorized`: the sign-in is
+    /// fine, so this must not set `needsReauth` or fire a sign-in-expired
+    /// notification. See `TokenSource.claudeCode`.
+    case claudeCodeUnreadable
 
     var errorDescription: String? {
         switch self {
         case .unauthorized:
             return "Session expired — sign in again."
+        case .claudeCodeUnreadable:
+            return "Waiting on Claude Code's credentials."
         case .rateLimited(let until):
             return "Rate limited — retrying after \(until.formatted(date: .omitted, time: .shortened))"
         case .http(let code, let body):
