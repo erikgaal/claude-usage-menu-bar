@@ -62,10 +62,25 @@ enum ClaudeCodeSession {
     // MARK: - Payload keys
 
     static let oauthKey = "claudeAiOauth"
-    /// Per-account material, replaced on every switch. Everything else in the
-    /// payload (`scopes`, `subscriptionType`, anything Anthropic adds later)
-    /// belongs to the profile and is carried across verbatim.
-    static let tokenKeys = ["accessToken", "refreshToken", "expiresAt"]
+
+    /// Fields that describe *one specific grant* and are therefore replaced
+    /// wholesale on every switch. Everything else in the block
+    /// (`subscriptionType`, `rateLimitTier`, anything Anthropic adds later)
+    /// describes the account, belongs to its profile, and is carried across
+    /// verbatim.
+    ///
+    /// `scopes` and `refreshTokenExpiresAt` are here for the same reason the
+    /// three token fields are, and getting that wrong is not theoretical: a
+    /// captured profile holds the grant Claude Code was using when we
+    /// snapshotted it, which is a different authorization from the token we
+    /// hand over. Restoring those two alongside our token told Claude Code the
+    /// session could do things the token was never granted — `/rc`
+    /// (remote-control) was offered and then failed — and could hand it a
+    /// refresh-token expiry belonging to a refresh token that no longer
+    /// exists, which is a way to be logged out early.
+    static let tokenBoundKeys = [
+        "accessToken", "refreshToken", "expiresAt", "scopes", "refreshTokenExpiresAt",
+    ]
 
     // MARK: - Expiry units
 
@@ -117,11 +132,15 @@ enum ClaudeCodeSession {
         let stored = StoredTokens(
             accessToken: accessToken,
             refreshToken: refreshToken,
-            expiresAt: unit.date(from: rawExpiry))
+            expiresAt: unit.date(from: rawExpiry),
+            // Carried along so a harvested token keeps its own grant. Without
+            // this, tokens rescued from Claude Code arrive scope-less and a
+            // later switch has nothing truthful to advertise for them.
+            scopes: oauth["scopes"] as? [String])
         return (stored, unit)
     }
 
-    /// An account's `claudeAiOauth` block with the per-account token material
+    /// An account's `claudeAiOauth` block with everything grant-specific
     /// stripped — what we keep as its profile so a later switch can restore
     /// fields we never synthesize ourselves.
     ///
@@ -132,7 +151,7 @@ enum ClaudeCodeSession {
     /// holding would ride along into the profile store.
     static func oauthExtras(from payload: [String: Any]) -> [String: Any] {
         var oauth = payload[oauthKey] as? [String: Any] ?? [:]
-        for key in tokenKeys { oauth.removeValue(forKey: key) }
+        for key in tokenBoundKeys { oauth.removeValue(forKey: key) }
         return oauth
     }
 
@@ -141,29 +160,25 @@ enum ClaudeCodeSession {
     /// Merging into `base` rather than replacing it is what keeps everything
     /// else in the item live and current — a profile only ever describes its
     /// own account, so it is never the authority on the rest of the payload.
+    ///
+    /// Every grant-specific field is written from `tokens`, never from
+    /// `extras`, so the block can only ever describe the token it actually
+    /// contains. An unknown grant is left absent rather than guessed at: a
+    /// missing `scopes` lets Claude Code fall back to what the server says the
+    /// token can do, whereas a wrong one has it offer features that then fail.
     static func payload(
         base: [String: Any], extras: [String: Any], tokens: StoredTokens,
         unit: ExpiresAtUnit
     ) -> [String: Any] {
         var oauth = extras
+        for key in tokenBoundKeys { oauth.removeValue(forKey: key) }
         oauth["accessToken"] = tokens.accessToken
         oauth["refreshToken"] = tokens.refreshToken
         oauth["expiresAt"] = unit.raw(from: tokens.expiresAt)
+        if let scopes = tokens.scopes { oauth["scopes"] = scopes }
         var payload = base
         payload[oauthKey] = oauth
         return payload
-    }
-
-    /// Extras for an account we've never captured from Claude Code.
-    ///
-    /// The scopes come from the token being handed over, not from
-    /// `OAuthConfig.scopes`: a token minted before that list grew carries the
-    /// narrower set for life, and advertising the current constant would tell
-    /// Claude Code it has capabilities it doesn't. `subscriptionType` is
-    /// deliberately omitted — Claude Code refetches the profile and fills in
-    /// what it needs, and inventing a wrong value is worse than absence.
-    static func synthesizedExtras(for tokens: StoredTokens) -> [String: Any] {
-        ["scopes": tokens.scopes ?? OAuthConfig.scopes]
     }
 
     // MARK: - Config file (pure)
@@ -459,10 +474,13 @@ extension ClaudeCodeStore {
             // Match whatever unit this install stores expiries in; default to
             // milliseconds, which is what Claude Code writes.
             let unit = ClaudeCodeSession.tokens(from: currentPayload)?.unit ?? .milliseconds
+            // Empty is a fine starting point for an account never captured:
+            // `payload` supplies everything grant-specific from the token, and
+            // Claude Code refetches the account-level fields it needs.
             let restored =
                 extras
                 .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                ?? ClaudeCodeSession.synthesizedExtras(for: tokens)
+                ?? [:]
 
             // `base` is the item as we just read it, so any credential beside
             // this account's OAuth block stays exactly as Claude Code left it.

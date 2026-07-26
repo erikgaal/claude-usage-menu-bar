@@ -86,13 +86,13 @@ final class ClaudeCodeSessionTests: XCTestCase {
 
     // MARK: Extracting a profile
 
-    func testExtrasDropOnlyTokenFields() {
+    func testExtrasDropEveryGrantBoundField() {
         let extras = ClaudeCodeSession.oauthExtras(from: makePayload())
-        for key in ClaudeCodeSession.tokenKeys {
-            XCTAssertNil(extras[key], "\(key) is per-account and must not be kept")
+        for key in ClaudeCodeSession.tokenBoundKeys {
+            XCTAssertNil(extras[key], "\(key) belongs to a grant and must not be kept")
         }
+        // Account-level fields are the whole point of keeping a profile.
         XCTAssertEqual(extras["subscriptionType"] as? String, "max")
-        XCTAssertEqual(extras["scopes"] as? [String], ["user:inference", "user:profile"])
     }
 
     func testExtrasKeepUnknownOAuthFieldsButNotSiblingCredentials() {
@@ -158,55 +158,102 @@ final class ClaudeCodeSessionTests: XCTestCase {
         XCTAssertNil(oauth["scopes"], "the outgoing account's scopes must not linger")
     }
 
-    func testRoundTripPreservesEverythingButTokens() {
-        // Read a payload, strip it to a profile, put fresh tokens back: the
-        // result must differ from the original in exactly the token fields.
+    func testRoundTripPreservesAccountFieldsAndReplacesGrantFields() {
+        // Read a payload, strip it to a profile, put a *different* grant back:
+        // account-level fields must survive untouched, and every grant-level
+        // field must describe the incoming token rather than the old one.
         let original = makePayload(
-            extraOAuthKeys: ["futureFlag": true], topLevel: ["other": "value"])
+            extraOAuthKeys: ["futureFlag": true, "refreshTokenExpiresAt": 1_900_000_000_000],
+            topLevel: ["other": "value"])
         let read = ClaudeCodeSession.tokens(from: original)
+        let incoming = StoredTokens(
+            accessToken: "new-access", refreshToken: "new-refresh", expiresAt: Self.expiry,
+            scopes: ["user:inference"])
         let rebuilt = ClaudeCodeSession.payload(
             base: original,
             extras: ClaudeCodeSession.oauthExtras(from: original),
-            tokens: makeTokens(), unit: read!.unit)
+            tokens: incoming, unit: read!.unit)
 
         XCTAssertEqual(rebuilt["other"] as? String, "value")
         let before = oauthBlock(of: original), after = oauthBlock(of: rebuilt)
-        XCTAssertEqual(Set(before.keys), Set(after.keys))
-        for key in before.keys where !ClaudeCodeSession.tokenKeys.contains(key) {
+        for key in before.keys where !ClaudeCodeSession.tokenBoundKeys.contains(key) {
             XCTAssertEqual(
                 before[key] as? NSObject, after[key] as? NSObject,
-                "\(key) should have survived untouched")
+                "\(key) describes the account and should have survived untouched")
         }
-        XCTAssertNotEqual(after["accessToken"] as? String, before["accessToken"] as? String)
+        XCTAssertEqual(after["accessToken"] as? String, "new-access")
+        // The grant travels with the token. Keeping the old payload's scopes
+        // here is what made Claude Code offer /rc on a token without it.
+        XCTAssertEqual(after["scopes"] as? [String], ["user:inference"])
+        XCTAssertNotEqual(after["scopes"] as? [String], before["scopes"] as? [String])
+        // Likewise the old refresh token's expiry, which describes a refresh
+        // token that no longer exists.
+        XCTAssertNil(after["refreshTokenExpiresAt"])
+    }
+
+    func testProfileNeverCarriesAnotherGrantsScopes() {
+        // The captured-profile path: a profile snapshotted while Claude Code
+        // held a wider grant must not lend those scopes to a narrower token.
+        let claudeCodePayload = makePayload(
+            extraOAuthKeys: [
+                "scopes": ["user:profile", "user:inference", "user:sessions:claude_code"],
+                "refreshTokenExpiresAt": 1_900_000_000_000,
+                "rateLimitTier": "default_claude_max_5x",
+            ])
+        let profile = ClaudeCodeSession.oauthExtras(from: claudeCodePayload)
+        XCTAssertNil(profile["scopes"], "a grant must not be kept as account metadata")
+        XCTAssertNil(profile["refreshTokenExpiresAt"])
+        XCTAssertEqual(profile["rateLimitTier"] as? String, "default_claude_max_5x")
+
+        let narrower = StoredTokens(
+            accessToken: "a", refreshToken: "r", expiresAt: Self.expiry,
+            scopes: ["user:profile", "user:inference"])
+        let oauth = oauthBlock(
+            of: ClaudeCodeSession.payload(
+                base: [:], extras: profile, tokens: narrower, unit: .milliseconds))
+
+        XCTAssertEqual(oauth["scopes"] as? [String], narrower.scopes)
+        XCTAssertFalse(
+            (oauth["scopes"] as? [String] ?? []).contains("user:sessions:claude_code"),
+            "a scope only the previous grant had must not reach the new token")
+    }
+
+    func testUnknownGrantIsOmittedRatherThanGuessed() {
+        // A token stored before scopes were recorded. Absent lets Claude Code
+        // fall back to what the server says; a guess makes it offer features
+        // that then fail.
+        let legacy = StoredTokens(
+            accessToken: "a", refreshToken: "r", expiresAt: Self.expiry, scopes: nil)
+        let oauth = oauthBlock(
+            of: ClaudeCodeSession.payload(
+                base: [:], extras: [:], tokens: legacy, unit: .milliseconds))
+
+        XCTAssertNil(oauth["scopes"])
+        XCTAssertEqual(oauth["accessToken"] as? String, "a")
+    }
+
+    func testHarvestedTokensKeepTheirOwnScopes() {
+        // Rescuing a token from Claude Code must rescue its grant too, or the
+        // next switch has nothing truthful to say about it.
+        let payload = makePayload(
+            extraOAuthKeys: ["scopes": ["user:profile", "user:sessions:claude_code"]])
+        XCTAssertEqual(
+            ClaudeCodeSession.tokens(from: payload)?.tokens.scopes,
+            ["user:profile", "user:sessions:claude_code"])
     }
 
     func testPayloadFromEmptyExtrasStillProducesUsableBlock() {
-        // Switching to an account never seen signed in: no captured profile.
-        let tokens = makeTokens()
+        // Switching to an account never seen signed in: no captured profile,
+        // so everything in the block comes from the token itself.
+        let tokens = StoredTokens(
+            accessToken: "new-access", refreshToken: "new-refresh",
+            expiresAt: Self.expiry, scopes: OAuthConfig.scopes)
         let rebuilt = ClaudeCodeSession.payload(
-            base: [:], extras: ClaudeCodeSession.synthesizedExtras(for: tokens),
-            tokens: tokens, unit: .milliseconds)
+            base: [:], extras: [:], tokens: tokens, unit: .milliseconds)
         let oauth = oauthBlock(of: rebuilt)
         XCTAssertEqual(oauth["accessToken"] as? String, "new-access")
-        // Scopes must be the ones this token was actually minted with, and
-        // must include the scope Claude Code checks before inferencing.
         XCTAssertEqual(oauth["scopes"] as? [String], OAuthConfig.scopes)
         XCTAssertTrue((oauth["scopes"] as? [String] ?? []).contains("user:inference"))
-    }
-
-    func testSynthesizedExtrasReportTheTokensOwnScopesNotTheCurrentConstant() {
-        // A token minted before the scope list grew keeps the narrower grant
-        // for life. Advertising `OAuthConfig.scopes` for it would tell Claude
-        // Code the session can do things the token isn't authorized for.
-        let legacy = StoredTokens(
-            accessToken: "a", refreshToken: "r", expiresAt: Self.expiry,
-            scopes: ["org:create_api_key", "user:profile", "user:inference"])
-        let extras = ClaudeCodeSession.synthesizedExtras(for: legacy)
-
-        XCTAssertEqual(extras["scopes"] as? [String], legacy.scopes)
-        XCTAssertFalse(
-            (extras["scopes"] as? [String] ?? []).contains("user:sessions:claude_code"),
-            "a scope the token never had must not be claimed on its behalf")
     }
 
     func testCurrentScopesCoverTheFeaturesClaudeCodeExpects() {
