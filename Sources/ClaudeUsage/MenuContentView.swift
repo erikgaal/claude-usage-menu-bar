@@ -216,20 +216,31 @@ struct AccountSection: View {
         )
     }
 
-    /// Label for the picker's nil (no manual choice) entry: names the
-    /// detected tier when detection succeeded, "Not set" otherwise.
-    private var autoPlanLabel: String {
-        guard let detected = store.accounts.first(where: { $0.id == account.id })?
-            .detectedQuotaMultiplier
-        else { return "Not set" }
-        return "Auto (\(Self.planName(for: detected)))"
+    private var storedAccount: AccountMeta? {
+        store.accounts.first { $0.id == account.id }
     }
 
+    /// Label for the picker's nil (no manual override) entry: the weight
+    /// detection settled on, or a plain statement that it didn't.
+    private var autoWeightLabel: String {
+        guard let detected = storedAccount?.detectedQuotaMultiplier else {
+            return "Auto — not detected"
+        }
+        return "Auto — \(Self.planName(for: detected)) (detected)"
+    }
+
+    /// The raw `rate_limit_tier` the API reported, for the informational row.
+    private var detectedTierText: String {
+        storedAccount?.detectedRateLimitTier ?? "none"
+    }
+
+    /// Plan-name hint for a weight — a hint, not a definition: several
+    /// subscriptions can share one weight (e.g. Max 5× and a Team seat).
     static func planName(for multiplier: Double) -> String {
         switch multiplier {
-        case 1: return "Pro"
-        case 5: return "Max 5×"
-        case 20: return "Max 20×"
+        case 1: return "Pro (×1)"
+        case 5: return "Max 5× (×5)"
+        case 20: return "Max 20× (×20)"
         default: return "×\(Int(multiplier))"
         }
     }
@@ -275,18 +286,30 @@ struct AccountSection: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Rename…") { startRenaming() }
-            // Plan tiers weight the shared burn pool behind the "Best"
-            // badge. Claude only: Codex tier ratios aren't reliably known,
-            // so those accounts stay "not set" (equal-weight pooling).
+            // The weight scales this account's window against the others
+            // when pooling burn rates behind the "Best" badge. Asking for a
+            // relative weight rather than a plan name keeps the user out of
+            // "is my Team premium seat a Max 5×?" territory: only the ratio
+            // between their own accounts matters. Claude only — Codex tier
+            // ratios aren't known, so those accounts stay unweighted.
             if account.provider == .claude {
-                Picker("Plan", selection: quotaMultiplierBinding) {
-                    Text("Pro (×1)").tag(Optional(1.0))
-                    Text("Max 5× (×5)").tag(Optional(5.0))
-                    Text("Max 20× (×20)").tag(Optional(20.0))
-                    // No manual choice: auto-detected tier when we have
-                    // one, plain "Not set" otherwise.
-                    Text(autoPlanLabel).tag(Optional<Double>.none)
+                Picker("Quota weight", selection: quotaMultiplierBinding) {
+                    // No manual override: the detected weight, or none.
+                    Text(autoWeightLabel).tag(Optional<Double>.none)
+                    Text("×1 — Pro").tag(Optional(1.0))
+                    Text("×5 — Max 5× or Team seat").tag(Optional(5.0))
+                    Text("×20 — Max 20×").tag(Optional(20.0))
+                    Divider()
+                    // Non-interactive: shows exactly what the server said,
+                    // so an unrecognized plan can still be weighted knowingly.
+                    Text("API reports: \(detectedTierText)")
                 }
+                .help(
+                    "How big this account's session window is relative to your "
+                        + "others (one full Pro window = ×1). Used to pool burn "
+                        + "rates across differently-sized subscriptions — getting "
+                        + "the ratio between your accounts right is what matters, "
+                        + "not identifying the plan exactly.")
             }
             if hasProviderPeers {
                 Button("Best-account details…") { showsBestDetails = true }

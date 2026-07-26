@@ -455,19 +455,65 @@ final class UsageAPITests: XCTestCase {
     }
 
     func testTierMappingTable() {
+        // Observed live on two real Team seats.
         XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "default_claude_max_5x"), 5)
         XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "default_claude_max_20x"), 20)
         XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "default_claude_pro"), 1)
-        // Unknown strings are never guessed at…
-        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: "default_claude_enterprise"))
-        // …and a present-but-unknown tier outranks the unreliable booleans.
+        // Unrecognized allocations are never guessed at…
+        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: "default_claude_team_premium"))
+        // …and a present-but-unrecognized tier outranks the unreliable booleans.
         XCTAssertNil(
             ClaudeTier.multiplier(
-                forRateLimitTier: "default_claude_enterprise", hasClaudePro: true))
+                forRateLimitTier: "default_claude_team_premium", hasClaudePro: true))
         // With no tier string at all, has_claude_pro is a last-resort hint.
         XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: nil, hasClaudePro: true), 1)
         XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: nil, hasClaudePro: false))
         XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: nil, hasClaudePro: nil))
+    }
+
+    func testTierMatchingToleratesPrefixAndSuffixVariants() {
+        // `rate_limit_tier` is the API's statement of the allocation, so any
+        // variant carrying a known marker inherits its weight — that's what
+        // makes unobserved Team/enterprise spellings land correctly.
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "team_claude_max_5x"), 5)
+        XCTAssertEqual(
+            ClaudeTier.multiplier(forRateLimitTier: "default_claude_max_5x_trial"), 5)
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "enterprise_max_20x_v2"), 20)
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "claude_pro_annual"), 1)
+    }
+
+    func testTwentyXIsNotMisMappedToFiveX() {
+        // The 20× marker is checked first; a 20× string also contains "max",
+        // and must never fall through to the 5× or Pro branches.
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "default_claude_max_20x"), 20)
+        XCTAssertEqual(
+            ClaudeTier.multiplier(forRateLimitTier: "pro_upgrade_claude_max_20x"), 20)
+        // An unfamiliar Max size is not silently read as Pro either.
+        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: "default_claude_max_50x"))
+        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: "claude_pro_max_50x"))
+    }
+
+    func testTierMatchingIsCaseInsensitive() {
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "DEFAULT_CLAUDE_MAX_5X"), 5)
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "Default_Claude_Max_20x"), 20)
+        XCTAssertEqual(ClaudeTier.multiplier(forRateLimitTier: "CLAUDE_PRO"), 1)
+    }
+
+    func testUnrecognizedTierMapsToNilAndKeepsRawString() async throws {
+        // A Team premium seat (no verified mapping, invented string here):
+        // the weight stays unknown, but the raw tier is retained so the UI
+        // can show "API reports: …" and the user can choose knowingly.
+        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: ""))
+        XCTAssertNil(ClaudeTier.multiplier(forRateLimitTier: "¯\\_(ツ)_/¯"))
+
+        URLProtocolStub.handler = { request in
+            (URLProtocolStub.httpResponse(for: request, status: 200),
+             Data(#"{"organization": {"rate_limit_tier": "default_claude_team_premium"}}"#.utf8))
+        }
+        let plan = try await UsageAPI.fetchProfile(
+            accessToken: "token", session: URLProtocolStub.makeSession())
+        XCTAssertEqual(plan.rateLimitTier, "default_claude_team_premium")
+        XCTAssertNil(plan.quotaMultiplier)
     }
 
     func testFetchProfileSendsUsageHeadersToProfileEndpoint() async throws {

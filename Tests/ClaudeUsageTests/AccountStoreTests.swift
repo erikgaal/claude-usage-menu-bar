@@ -732,6 +732,34 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(provider.profileCalls.count, 1)
     }
 
+    func testUnmappedTierIsStoredForDisplayWithoutAWeight() async throws {
+        // A tier we can't map (e.g. a Team premium seat) must still be
+        // persisted verbatim: the picker shows "API reports: …" so the user
+        // can set the weight knowingly, and the pool stays unweighted until
+        // they do.
+        let account = makeAccount()
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
+        provider.profileResult = .success(
+            DetectedPlan(rateLimitTier: "default_claude_team_premium", quotaMultiplier: nil))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()])
+
+        await harness.store.refresh(account: account, force: false)
+        await waitFor {
+            harness.store.accounts.first?.detectedRateLimitTier
+                == "default_claude_team_premium"
+        }
+
+        XCTAssertNil(harness.store.accounts.first?.detectedQuotaMultiplier)
+        XCTAssertNil(harness.store.accounts.first?.effectiveQuotaMultiplier)
+        XCTAssertEqual(
+            try decodedAccounts(in: harness.defaults).first?.detectedRateLimitTier,
+            "default_claude_team_premium")
+        // Retained, so the unmappable tier isn't refetched every refresh.
+        await harness.store.refresh(account: account, force: true)
+        XCTAssertEqual(provider.profileCalls.count, 1)
+    }
+
     func testStoreLoginTriggersPlanDetection() async throws {
         let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
         provider.profileResult = .success(

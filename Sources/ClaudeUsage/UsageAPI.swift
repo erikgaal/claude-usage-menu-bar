@@ -17,27 +17,41 @@ enum UsageError: LocalizedError {
     }
 }
 
-/// Maps Claude's `organization.rate_limit_tier` strings to session-quota
-/// multipliers. Exact matches only: an unrecognized tier maps to nil —
-/// never guessed — so the ranking falls back to equal weights rather than
-/// silently mis-weighting the pool.
+/// Maps Claude's `organization.rate_limit_tier` strings to relative quota
+/// weights (one full Pro session window = ×1).
+///
+/// Matching is by *marker substring*, not exact string: `rate_limit_tier` is
+/// the API's own statement of the rate-limit allocation, so any prefix or
+/// suffix variant carrying a known marker — `team_claude_max_5x`,
+/// `default_claude_max_5x_trial`, … — inherits that marker's weight. This is
+/// what makes unobserved Team/enterprise variants land correctly: two real
+/// Team seats were observed reporting plain `default_claude_max_5x`, i.e.
+/// Team seats speak the same `max_Nx` vocabulary.
+///
+/// `organization.seat_tier` (e.g. "team_tier_1") is deliberately ignored: it
+/// is a billing/entitlement axis, not a rate-limit one. A tier string with no
+/// recognizable marker maps to nil — never guessed — so the ranking falls
+/// back to equal weights rather than silently mis-weighting the pool, and
+/// the raw string is surfaced in the UI so the user can pick a weight
+/// knowingly.
 enum ClaudeTier {
-    /// Verified live: a Max 5× Team org reports "default_claude_max_5x".
-    /// "default_claude_max_20x" follows the same scheme. "default_claude_pro"
-    /// is best-effort — no live sample yet — and the account-level
-    /// `has_claude_pro` boolean is used only as a last-resort ×1 hint when
-    /// the tier string is absent entirely (the booleans were observed false
-    /// on org-billed plans, so they must never override a tier string).
+    /// The 20× marker must be checked first: "…max_20x" also contains the
+    /// substring "max_2"/"max" and would otherwise fall through wrongly.
+    /// The account-level `has_claude_pro` boolean is only a last-resort ×1
+    /// hint when the tier string is absent entirely (the booleans were
+    /// observed false on org-billed plans, so they must never override or
+    /// second-guess a tier string that exists).
     static func multiplier(
         forRateLimitTier tier: String?, hasClaudePro: Bool? = nil
     ) -> Double? {
-        switch tier {
-        case "default_claude_max_5x": return 5
-        case "default_claude_max_20x": return 20
-        case "default_claude_pro": return 1
-        case .some: return nil  // unknown tier — don't guess
-        case nil: return hasClaudePro == true ? 1 : nil
-        }
+        guard let tier else { return hasClaudePro == true ? 1 : nil }
+        let normalized = tier.lowercased()
+        if normalized.contains("max_20x") { return 20 }
+        if normalized.contains("max_5x") { return 5 }
+        // "pro" only counts when no Max marker is present at all, so an
+        // unfamiliar "…max_50x…" never reads as Pro.
+        if normalized.contains("pro"), !normalized.contains("max") { return 1 }
+        return nil  // unrecognized allocation — don't guess
     }
 }
 
