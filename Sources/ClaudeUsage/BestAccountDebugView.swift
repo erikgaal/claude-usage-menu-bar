@@ -74,7 +74,29 @@ struct BestAccountDebugView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // The weekly leg's input (issue #21), in weekly units — never
+            // comparable with the session line above, so it names its window
+            // and its reset explicitly.
+            if trace.weeklyAggregatePace > 0,
+                let percent = candidate.weeklyAtRiskPercent,
+                let atRiskUnits = candidate.weeklyAtRiskUnits {
+                Text(
+                    "≈\(Int(percent.rounded()))% of "
+                        + "\(candidate.weeklyName ?? "weekly") at risk before "
+                        + "\(weeklyResetText(candidate)) (\(units(atRiskUnits)))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
+    }
+
+    /// "reset in 3d 0h" for a live weekly window, plain "reset" when the API
+    /// reported none (nothing can expire, so there is no clock to show).
+    private func weeklyResetText(_ candidate: BestAccount.CandidateTrace) -> String {
+        guard let resetsAt = candidate.weeklyResetsAt, resetsAt > Date() else {
+            return "reset"
+        }
+        return "reset in \(AccountSection.durationText(until: resetsAt))"
     }
 
     private func planText(_ candidate: BestAccount.CandidateTrace) -> String {
@@ -152,12 +174,18 @@ struct BestAccountDebugView: View {
             return lines
         case .expiringFirst(let award):
             var lines = poolLines
+            // The weekly leg is only ever reached because the session leg
+            // stood down, so show that stand-down reason first (issue #21).
+            if award.leg == .weekly {
+                lines += fallbackLines(trace.capacityFallback, leg: .session)
+            }
+            let name = legName(award.leg)
             var expiring =
-                "Expiring-first: \(label(award.badgedID)) has \(units(award.atRiskUnits)) "
-                + "at risk (floor ≥ \(units(BestAccount.atRiskFloor)))"
+                "\(name): \(label(award.badgedID)) has \(units(award.atRiskUnits)) "
+                + "at risk (floor ≥ \(units(floorUnits(of: award.leg))))"
             if let gap = award.atRiskGapUnits {
                 expiring += ", leads by \(units(gap)) "
-                    + "(needs ≥ \(units(BestAccount.atRiskMargin)))."
+                    + "(needs ≥ \(units(marginUnits(of: award.leg))))."
             } else {
                 expiring += "."
             }
@@ -168,29 +196,52 @@ struct BestAccountDebugView: View {
     }
 
     /// The expiring-capacity preamble for a v2-decided group: the demand
-    /// signal and why the expiring-first path stood down.
+    /// signal and why each expiring-first leg stood down.
     private var prefixLines: [String] {
-        var lines = poolLines
-        switch trace.capacityFallback {
-        case .noAggregatePace:
-            lines.append("Expiring-first: no burn-rate data — using headroom ranking.")
-        case .belowFloor(let topAtRiskUnits):
-            lines.append(
-                "Expiring-first: at most \(units(topAtRiskUnits)) at risk "
-                    + "(floor ≥ \(units(BestAccount.atRiskFloor))) — using headroom ranking.")
-        case .atRiskTooClose(let leaderID, let runnerUpID, let gapUnits):
-            lines.append(
-                "Expiring-first: \(label(leaderID)) leads \(label(runnerUpID)) by only "
-                    + "\(units(gapUnits)) at risk (needs ≥ \(units(BestAccount.atRiskMargin))) "
-                    + "— using headroom ranking.")
-        case nil:
-            break
-        }
-        return lines
+        poolLines
+            + fallbackLines(trace.capacityFallback, leg: .session)
+            + fallbackLines(trace.weeklyCapacityFallback, leg: .weekly)
     }
 
-    /// Pooled-demand summary plus the honesty annotation when plans are
-    /// missing and the pool fell back to equal weights.
+    /// Why one leg stood down, in its own units and against its own
+    /// constants — nothing when that leg decided or was never consulted.
+    private func fallbackLines(
+        _ fallback: BestAccount.CapacityFallback?, leg: BestAccount.ExpiringAward.Leg
+    ) -> [String] {
+        let name = legName(leg)
+        switch fallback {
+        case .noAggregatePace:
+            return ["\(name): no burn-rate data — using headroom ranking."]
+        case .belowFloor(let topAtRiskUnits):
+            return [
+                "\(name): at most \(units(topAtRiskUnits)) at risk "
+                    + "(floor ≥ \(units(floorUnits(of: leg)))) — using headroom ranking."
+            ]
+        case .atRiskTooClose(let leaderID, let runnerUpID, let gapUnits):
+            return [
+                "\(name): \(label(leaderID)) leads \(label(runnerUpID)) by only "
+                    + "\(units(gapUnits)) at risk (needs ≥ \(units(marginUnits(of: leg)))) "
+                    + "— using headroom ranking."
+            ]
+        case nil:
+            return []
+        }
+    }
+
+    private func legName(_ leg: BestAccount.ExpiringAward.Leg) -> String {
+        leg == .session ? "Expiring-first" : "Expiring-first (weekly)"
+    }
+
+    private func floorUnits(of leg: BestAccount.ExpiringAward.Leg) -> Double {
+        leg == .session ? BestAccount.atRiskFloor : BestAccount.weeklyAtRiskFloor
+    }
+
+    private func marginUnits(of leg: BestAccount.ExpiringAward.Leg) -> Double {
+        leg == .session ? BestAccount.atRiskMargin : BestAccount.weeklyAtRiskMargin
+    }
+
+    /// Pooled-demand summary for both legs plus the honesty annotation when
+    /// plans are missing and the pool fell back to equal weights.
     private var poolLines: [String] {
         var lines: [String] = []
         if trace.aggregatePace > 0 {
@@ -199,6 +250,13 @@ struct BestAccountDebugView: View {
                     + "(1 unit = a full Pro session).")
         } else {
             lines.append("Pooled demand: no data.")
+        }
+        if trace.weeklyAggregatePace > 0 {
+            lines.append(
+                "Pooled weekly demand: \(units(trace.weeklyAggregatePace))/h "
+                    + "(1 unit = a full Pro week).")
+        } else {
+            lines.append("Pooled weekly demand: no data.")
         }
         if trace.quotaWeighting == .equalWeightsAssumed {
             lines.append("Plans not set — assuming equal quotas.")

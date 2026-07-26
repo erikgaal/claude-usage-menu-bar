@@ -231,13 +231,32 @@ final class AccountStoreTests: XCTestCase {
             credits: nil)
     }
 
-    /// Seeds a synthetic session-limit ramp into the harness's history
+    /// A "Session" window plus one weekly window resetting `weeklyResetIn`
+    /// from now — the shape the weekly leg of the best-account hint needs.
+    private func makeWeeklySnapshot(
+        session: Double, weekly: Double, weeklyResetIn: TimeInterval
+    ) -> UsageSnapshot {
+        UsageSnapshot(
+            limits: [
+                LimitStatus(
+                    id: "session|", name: "Session", percent: session,
+                    resetsAt: nil, isActive: true, sortOrder: 0),
+                LimitStatus(
+                    id: "weekly_all|", name: "Weekly", percent: weekly,
+                    resetsAt: Date().addingTimeInterval(weeklyResetIn),
+                    isActive: false, sortOrder: 1),
+            ],
+            credits: nil)
+    }
+
+    /// Seeds a synthetic ramp for one limit into the harness's history
     /// directory: 12 samples five minutes apart, climbing at `ratePerHour`
     /// and ending at `endPercent` right about now. Written through a second
     /// `UsageHistoryStore` over the same directory, which the store's own
     /// history store picks up from disk on first read.
     private func seedSessionRamp(
-        directory: URL, account: String, endPercent: Double, ratePerHour: Double
+        directory: URL, account: String, endPercent: Double, ratePerHour: Double,
+        limitID: String = "session|", limitName: String = "Session"
     ) {
         let store = UsageHistoryStore(directory: directory)
         let now = Date()
@@ -246,7 +265,7 @@ final class AccountStoreTests: XCTestCase {
         for index in 0..<count {
             let stepsBack = Double(count - 1 - index)
             let limit = LimitStatus(
-                id: "session|", name: "Session",
+                id: limitID, name: limitName,
                 percent: endPercent - ratePerHour * stepsBack * interval / 3600,
                 resetsAt: nil, isActive: true, sortOrder: 0)
             store.record(
@@ -887,6 +906,55 @@ final class AccountStoreTests: XCTestCase {
         let projected = try XCTUnwrap(badges[slow.id]?.projectedExhaustion)
         let expected = Date().addingTimeInterval(15 * 3600)
         XCTAssertEqual(projected.timeIntervalSince(expected), 0, accuracy: 900)
+    }
+
+    func testBestBadgesAreWeeklyAwareEndToEnd() async throws {
+        // Issue #21's live shape, sessions inverted so the two rankings
+        // disagree: acct-1 has 40% of its session gone against acct-2's 5%,
+        // so session headroom favours acct-2 — but acct-1's week is 31% spent
+        // and resets in 3 days, while acct-2's is 15% spent with 5d15h of
+        // runway. Only weekly windows have a history ramp (0.6 and 0.4 pp/h),
+        // so the session leg has no demand signal and the weekly leg decides:
+        // the store must ask its history store for weekly rates and hand the
+        // badge — with the window named — to the account about to waste 69%
+        // of its week.
+        let work = makeAccount(id: "acct-1")
+        let alt = makeAccount(id: "acct-2", email: "other@example.com")
+        let provider = ProviderFake()
+        provider.setFetchResult(
+            .success(
+                makeWeeklySnapshot(session: 40, weekly: 31, weeklyResetIn: 72 * 3600)),
+            forAccount: work.id)
+        provider.setFetchResult(
+            .success(
+                makeWeeklySnapshot(session: 5, weekly: 15, weeklyResetIn: 135 * 3600)),
+            forAccount: alt.id)
+        let harness = makeHarness(
+            provider: provider, accounts: [work, alt],
+            vault: [work.id: makeTokens(), alt.id: makeTokens()])
+        seedSessionRamp(
+            directory: harness.historyDirectory, account: work.id,
+            endPercent: 31, ratePerHour: 0.6,
+            limitID: "weekly_all|", limitName: "Weekly")
+        seedSessionRamp(
+            directory: harness.historyDirectory, account: alt.id,
+            endPercent: 15, ratePerHour: 0.4,
+            limitID: "weekly_all|", limitName: "Weekly")
+
+        await harness.store.refresh(account: work, force: false)
+        await harness.store.refresh(account: alt, force: false)
+
+        let badges = harness.store.bestBadges
+        XCTAssertEqual(Set(badges.keys), [work.id])
+        let expiring = try XCTUnwrap(badges[work.id]?.expiring)
+        XCTAssertEqual(expiring.points, 69, accuracy: 1)
+        XCTAssertEqual(expiring.scopeName, "Weekly")
+        // …and the trace the debug popover renders shows the weekly pool.
+        let trace = try XCTUnwrap(harness.store.bestAccountTrace(for: .claude))
+        XCTAssertEqual(trace.aggregatePace, 0)
+        XCTAssertEqual(trace.weeklyAggregatePace, 0.01, accuracy: 0.002)
+        XCTAssertEqual(trace.capacityFallback, .noAggregatePace)
+        XCTAssertNil(trace.weeklyCapacityFallback)
     }
 
     // MARK: Trend charts

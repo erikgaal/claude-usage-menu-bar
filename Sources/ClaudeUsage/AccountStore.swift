@@ -126,6 +126,7 @@ final class AccountStore: ObservableObject {
             accounts: accounts, states: states,
             sessionProjections: sessionProjections,
             sessionBurnRates: sessionBurnRates,
+            weeklyBurnRates: weeklyBurnRates,
             quotas: quotas, now: Date())
     }
 
@@ -138,6 +139,7 @@ final class AccountStore: ObservableObject {
             accounts: accounts, states: states,
             sessionProjections: sessionProjections,
             sessionBurnRates: sessionBurnRates,
+            weeklyBurnRates: weeklyBurnRates,
             quotas: quotas, now: Date()
         ).first { $0.provider == provider }
     }
@@ -186,6 +188,29 @@ final class AccountStore: ObservableObject {
                     accountID: account.id, limitID: session.id)
             else { continue }
             rates[account.id] = rate
+        }
+        return rates
+    }
+
+    /// Weekly-scoped burn rates (%/hour) per account id, then per limit id —
+    /// the weekly leg of the best-account hint (issue #21) needs one rate per
+    /// window, since an account can have several (overall weekly, model-scoped
+    /// ones like Fable, a Codex secondary window). The history store already
+    /// fits these with a weekly-appropriate lookback; windows with no fittable
+    /// history (idle, thin, mock mode) are simply absent, which the ranking
+    /// reads as zero demand — and with nothing anywhere the weekly leg stands
+    /// down and the v3/v2 behavior is unchanged.
+    private var weeklyBurnRates: [String: [String: Double]] {
+        var rates: [String: [String: Double]] = [:]
+        for account in accounts {
+            guard let limits = states[account.id]?.limits else { continue }
+            var perLimit: [String: Double] = [:]
+            for window in BestAccount.weeklyWindows(in: limits) {
+                if let rate = history.burnRate(accountID: account.id, limitID: window.id) {
+                    perLimit[window.id] = rate
+                }
+            }
+            if !perLimit.isEmpty { rates[account.id] = perLimit }
         }
         return rates
     }
