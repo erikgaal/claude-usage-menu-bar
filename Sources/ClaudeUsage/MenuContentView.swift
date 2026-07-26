@@ -192,10 +192,57 @@ struct AccountSection: View {
 
     @State private var isRenaming = false
     @State private var draftName = ""
+    @State private var showsBestDetails = false
     @FocusState private var renameFocused: Bool
 
     private var state: AccountDisplayState {
         store.states[account.id] ?? AccountDisplayState()
+    }
+
+    /// Whether this account has same-provider company — the only case where
+    /// the best-account hint (and its debug breakdown) means anything.
+    private var hasProviderPeers: Bool {
+        store.accounts.filter { $0.provider == account.provider }.count >= 2
+    }
+
+    /// The account's plan multiplier, read live from the store (the section
+    /// holds an immutable `account` snapshot) and written through it.
+    private var quotaMultiplierBinding: Binding<Double?> {
+        Binding(
+            get: {
+                store.accounts.first { $0.id == account.id }?.quotaMultiplier
+            },
+            set: { store.setQuotaMultiplier(account, to: $0) }
+        )
+    }
+
+    private var storedAccount: AccountMeta? {
+        store.accounts.first { $0.id == account.id }
+    }
+
+    /// Label for the picker's nil (no manual override) entry: the weight
+    /// detection settled on, or a plain statement that it didn't.
+    private var autoWeightLabel: String {
+        guard let detected = storedAccount?.detectedQuotaMultiplier else {
+            return "Auto — not detected"
+        }
+        return "Auto — \(Self.planName(for: detected)) (detected)"
+    }
+
+    /// The raw `rate_limit_tier` the API reported, for the informational row.
+    private var detectedTierText: String {
+        storedAccount?.detectedRateLimitTier ?? "none"
+    }
+
+    /// Plan-name hint for a weight — a hint, not a definition: several
+    /// subscriptions can share one weight (e.g. Max 5× and a Team seat).
+    static func planName(for multiplier: Double) -> String {
+        switch multiplier {
+        case 1: return "Pro (×1)"
+        case 5: return "Max 5× (×5)"
+        case 20: return "Max 20× (×20)"
+        default: return "×\(Int(multiplier))"
+        }
     }
 
     var body: some View {
@@ -239,6 +286,34 @@ struct AccountSection: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Rename…") { startRenaming() }
+            // The weight scales this account's window against the others
+            // when pooling burn rates behind the "Best" badge. Asking for a
+            // relative weight rather than a plan name keeps the user out of
+            // "is my Team premium seat a Max 5×?" territory: only the ratio
+            // between their own accounts matters. Claude only — Codex tier
+            // ratios aren't known, so those accounts stay unweighted.
+            if account.provider == .claude {
+                Picker("Quota weight", selection: quotaMultiplierBinding) {
+                    // No manual override: the detected weight, or none.
+                    Text(autoWeightLabel).tag(Optional<Double>.none)
+                    Text("×1 — Pro").tag(Optional(1.0))
+                    Text("×5 — Max 5× or Team seat").tag(Optional(5.0))
+                    Text("×20 — Max 20×").tag(Optional(20.0))
+                    Divider()
+                    // Non-interactive: shows exactly what the server said,
+                    // so an unrecognized plan can still be weighted knowingly.
+                    Text("API reports: \(detectedTierText)")
+                }
+                .help(
+                    "How big this account's session window is relative to your "
+                        + "others (one full Pro window = ×1). Used to pool burn "
+                        + "rates across differently-sized subscriptions — getting "
+                        + "the ratio between your accounts right is what matters, "
+                        + "not identifying the plan exactly.")
+            }
+            if hasProviderPeers {
+                Button("Best-account details…") { showsBestDetails = true }
+            }
             Divider()
             // Order matters beyond the panel: it also sets the menu bar
             // summary order, so surface reordering right where accounts live.
@@ -281,8 +356,14 @@ struct AccountSection: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 0)
-            if store.bestAccountIDs.contains(account.id) {
-                BestBadge()
+            if let badge = store.bestBadges[account.id] {
+                BestBadge(badge: badge)
+                    .onTapGesture { showsBestDetails = true }
+            }
+        }
+        .popover(isPresented: $showsBestDetails, arrowEdge: .bottom) {
+            if let trace = store.bestAccountTrace(for: account.provider) {
+                BestAccountDebugView(trace: trace)
             }
         }
     }
@@ -434,9 +515,13 @@ struct AccountSection: View {
 // MARK: - Building blocks
 
 /// Quiet "use this one" capsule for the same-provider account with the most
-/// session headroom (see `AccountStore.bestAccountIDs`). Styled as a hint,
-/// not an alarm: small type, soft tint, no icon.
+/// session headroom (see `AccountStore.bestBadges`). Styled as a hint, not an
+/// alarm: small type, soft tint, no icon. When the ranking has a pace
+/// projection for the badged account the tooltip becomes time-based;
+/// otherwise it keeps the static v1 text.
 struct BestBadge: View {
+    let badge: BestAccount.Badge
+
     var body: some View {
         Text("Best")
             .font(.caption2.weight(.semibold))
@@ -444,7 +529,21 @@ struct BestBadge: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(Capsule().fill(Color.green.opacity(0.15)))
-            .help("Most session headroom right now")
+            .help(tooltip)
+    }
+
+    private var tooltip: String {
+        // Expiring-first (v3): explain what is about to vanish and when.
+        if let expiring = badge.expiring {
+            let untilReset = AccountSection.durationText(until: expiring.resetsAt)
+            return "≈\(Int(expiring.points.rounded()))% expires at reset in "
+                + "\(untilReset) — use this first"
+        }
+        guard let projected = badge.projectedExhaustion else {
+            return "Most session headroom right now"
+        }
+        let left = AccountSection.durationText(until: projected)
+        return "≈\(left) of session left at current pace"
     }
 }
 

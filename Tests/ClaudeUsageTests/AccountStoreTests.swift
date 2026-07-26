@@ -34,8 +34,10 @@ private final class ProviderFake: UsageProvider, @unchecked Sendable {
     private var _fetchResult: Result<UsageSnapshot, Error>
     private var _refreshResult: Result<StoredTokens, Error>
     private var _loginResult: Result<LoginResult, Error>
+    private var _profileResult: Result<DetectedPlan?, Error>
     private var _fetchCalls: [(accessToken: String, accountID: String)] = []
     private var _refreshCalls: [StoredTokens] = []
+    private var _profileCalls: [String] = []
 
     init(
         id: ProviderID = .claude,
@@ -45,6 +47,7 @@ private final class ProviderFake: UsageProvider, @unchecked Sendable {
         _fetchResult = fetchResult
         _refreshResult = .failure(UsageError.http(0, "token refresh not stubbed"))
         _loginResult = .failure(UsageError.http(0, "login not stubbed"))
+        _profileResult = .success(nil)
     }
 
     var fetchResult: Result<UsageSnapshot, Error> {
@@ -59,11 +62,18 @@ private final class ProviderFake: UsageProvider, @unchecked Sendable {
         get { lock.withLock { _loginResult } }
         set { lock.withLock { _loginResult = newValue } }
     }
+    var profileResult: Result<DetectedPlan?, Error> {
+        get { lock.withLock { _profileResult } }
+        set { lock.withLock { _profileResult = newValue } }
+    }
     var fetchCalls: [(accessToken: String, accountID: String)] {
         lock.withLock { _fetchCalls }
     }
     var refreshCalls: [StoredTokens] {
         lock.withLock { _refreshCalls }
+    }
+    var profileCalls: [String] {
+        lock.withLock { _profileCalls }
     }
 
     func setFetchResult(_ result: Result<UsageSnapshot, Error>, forAccount accountID: String) {
@@ -86,6 +96,14 @@ private final class ProviderFake: UsageProvider, @unchecked Sendable {
         let result: Result<UsageSnapshot, Error> = lock.withLock {
             _fetchCalls.append((accessToken, accountID))
             return _fetchResultsByAccount[accountID] ?? _fetchResult
+        }
+        return try result.get()
+    }
+
+    func fetchProfile(accessToken: String) async throws -> DetectedPlan? {
+        let result: Result<DetectedPlan?, Error> = lock.withLock {
+            _profileCalls.append(accessToken)
+            return _profileResult
         }
         return try result.get()
     }
@@ -198,6 +216,43 @@ final class AccountStoreTests: XCTestCase {
                     resetsAt: nil, isActive: index == 0, sortOrder: index)
             },
             credits: credits)
+    }
+
+    /// A single "Session" window at `percent`, shaped like the providers
+    /// build it, so `BestAccount` and the history store treat it as the
+    /// session slot.
+    private func makeSessionSnapshot(percent: Double) -> UsageSnapshot {
+        UsageSnapshot(
+            limits: [
+                LimitStatus(
+                    id: "session|", name: "Session", percent: percent,
+                    resetsAt: nil, isActive: true, sortOrder: 0)
+            ],
+            credits: nil)
+    }
+
+    /// Seeds a synthetic session-limit ramp into the harness's history
+    /// directory: 12 samples five minutes apart, climbing at `ratePerHour`
+    /// and ending at `endPercent` right about now. Written through a second
+    /// `UsageHistoryStore` over the same directory, which the store's own
+    /// history store picks up from disk on first read.
+    private func seedSessionRamp(
+        directory: URL, account: String, endPercent: Double, ratePerHour: Double
+    ) {
+        let store = UsageHistoryStore(directory: directory)
+        let now = Date()
+        let interval: TimeInterval = 300
+        let count = 12
+        for index in 0..<count {
+            let stepsBack = Double(count - 1 - index)
+            let limit = LimitStatus(
+                id: "session|", name: "Session",
+                percent: endPercent - ratePerHour * stepsBack * interval / 3600,
+                resetsAt: nil, isActive: true, sortOrder: 0)
+            store.record(
+                [limit], accountID: account,
+                at: now.addingTimeInterval(-stepsBack * interval))
+        }
     }
 
     private func makeLogin(
@@ -593,7 +648,8 @@ final class AccountStoreTests: XCTestCase {
     }
 
     func testLegacyAccountsDecodeWithClaudeProviderAndNoLabel() {
-        // Accounts saved before multi-provider/label support lack those keys.
+        // Accounts saved before multi-provider/label/plan support lack
+        // those keys.
         let defaults = makeDefaults()
         let legacyJSON = #"[{"id":"legacy","email":"old@example.com"}]"#
         defaults.set(Data(legacyJSON.utf8), forKey: "accounts")
@@ -603,7 +659,138 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(harness.store.accounts.map(\.id), ["legacy"])
         XCTAssertEqual(harness.store.accounts.first?.provider, .claude)
         XCTAssertNil(harness.store.accounts.first?.label)
+        XCTAssertNil(harness.store.accounts.first?.quotaMultiplier)
+        XCTAssertNil(harness.store.accounts.first?.detectedRateLimitTier)
+        XCTAssertNil(harness.store.accounts.first?.detectedQuotaMultiplier)
+        XCTAssertNil(harness.store.accounts.first?.effectiveQuotaMultiplier)
         XCTAssertEqual(harness.store.accounts.first?.displayLabel, "Claude")
+    }
+
+    func testQuotaMultiplierPersistsAndRoundTrips() throws {
+        // Setting a plan writes it through the same persistence the account
+        // list uses; a fresh store over the same defaults sees it, and
+        // clearing it back to "not set" round-trips as nil.
+        let defaults = makeDefaults()
+        let account = makeAccount()
+        let harness = makeHarness(accounts: [account], defaults: defaults)
+
+        harness.store.setQuotaMultiplier(account, to: 20)
+        XCTAssertEqual(harness.store.accounts.first?.quotaMultiplier, 20)
+        XCTAssertEqual(try decodedAccounts(in: defaults).first?.quotaMultiplier, 20)
+
+        let reloaded = makeHarness(defaults: defaults)
+        XCTAssertEqual(reloaded.store.accounts.first?.quotaMultiplier, 20)
+
+        reloaded.store.setQuotaMultiplier(account, to: nil)
+        XCTAssertNil(reloaded.store.accounts.first?.quotaMultiplier)
+        XCTAssertNil(try decodedAccounts(in: defaults).first?.quotaMultiplier)
+    }
+
+    // MARK: Plan detection
+
+    func testRefreshDetectsPlanTierOncePerLaunch() async throws {
+        let account = makeAccount()
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
+        provider.profileResult = .success(
+            DetectedPlan(rateLimitTier: "default_claude_max_5x", quotaMultiplier: 5))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()])
+
+        await harness.store.refresh(account: account, force: false)
+        await waitFor { harness.store.accounts.first?.detectedQuotaMultiplier == 5 }
+
+        XCTAssertEqual(
+            harness.store.accounts.first?.detectedRateLimitTier, "default_claude_max_5x")
+        // The detection is persisted alongside the account metadata…
+        XCTAssertEqual(
+            try decodedAccounts(in: harness.defaults).first?.detectedQuotaMultiplier, 5)
+        // …and not refetched on the next refresh.
+        await harness.store.refresh(account: account, force: true)
+        XCTAssertEqual(provider.profileCalls.count, 1)
+    }
+
+    func testProfileFailureIsSilentAndNeverAffectsUsage() async {
+        let account = makeAccount()
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot(percents: [42])))
+        provider.profileResult = .failure(UsageError.http(500, "profile boom"))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()],
+            notificationsEnabled: true)
+
+        await harness.store.refresh(account: account, force: false)
+        await waitFor { provider.profileCalls.count == 1 }
+
+        // Usage is intact, no error surfaced, nothing detected, no alerts.
+        let state = harness.store.states[account.id]
+        XCTAssertEqual(state?.limits.map(\.percent), [42])
+        XCTAssertNil(state?.error)
+        XCTAssertNil(harness.store.accounts.first?.detectedQuotaMultiplier)
+        XCTAssertTrue(harness.scheduler.posted.isEmpty)
+
+        // Failed detection is not retried this launch (no polling loop).
+        await harness.store.refresh(account: account, force: true)
+        XCTAssertEqual(provider.profileCalls.count, 1)
+    }
+
+    func testUnmappedTierIsStoredForDisplayWithoutAWeight() async throws {
+        // A tier we can't map (e.g. a Team premium seat) must still be
+        // persisted verbatim: the picker shows "API reports: …" so the user
+        // can set the weight knowingly, and the pool stays unweighted until
+        // they do.
+        let account = makeAccount()
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
+        provider.profileResult = .success(
+            DetectedPlan(rateLimitTier: "default_claude_team_premium", quotaMultiplier: nil))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()])
+
+        await harness.store.refresh(account: account, force: false)
+        await waitFor {
+            harness.store.accounts.first?.detectedRateLimitTier
+                == "default_claude_team_premium"
+        }
+
+        XCTAssertNil(harness.store.accounts.first?.detectedQuotaMultiplier)
+        XCTAssertNil(harness.store.accounts.first?.effectiveQuotaMultiplier)
+        XCTAssertEqual(
+            try decodedAccounts(in: harness.defaults).first?.detectedRateLimitTier,
+            "default_claude_team_premium")
+        // Retained, so the unmappable tier isn't refetched every refresh.
+        await harness.store.refresh(account: account, force: true)
+        XCTAssertEqual(provider.profileCalls.count, 1)
+    }
+
+    func testStoreLoginTriggersPlanDetection() async throws {
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
+        provider.profileResult = .success(
+            DetectedPlan(rateLimitTier: "default_claude_max_20x", quotaMultiplier: 20))
+        let harness = makeHarness(provider: provider)
+
+        try harness.store.storeLogin(makeLogin(), provider: .claude)
+
+        await waitFor { harness.store.accounts.first?.detectedQuotaMultiplier == 20 }
+        XCTAssertEqual(
+            harness.store.accounts.first?.detectedRateLimitTier, "default_claude_max_20x")
+    }
+
+    func testManualPlanChoiceOutranksDetectedTier() async {
+        let account = makeAccount()
+        let provider = ProviderFake(fetchResult: .success(makeSnapshot()))
+        provider.profileResult = .success(
+            DetectedPlan(rateLimitTier: "default_claude_max_5x", quotaMultiplier: 5))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()])
+
+        await harness.store.refresh(account: account, force: false)
+        await waitFor { harness.store.accounts.first?.detectedQuotaMultiplier == 5 }
+        XCTAssertEqual(harness.store.accounts.first?.effectiveQuotaMultiplier, 5)
+
+        harness.store.setQuotaMultiplier(account, to: 20)
+        XCTAssertEqual(harness.store.accounts.first?.effectiveQuotaMultiplier, 20)
+
+        // Clearing the manual choice falls back to the detected tier.
+        harness.store.setQuotaMultiplier(account, to: nil)
+        XCTAssertEqual(harness.store.accounts.first?.effectiveQuotaMultiplier, 5)
     }
 
     // MARK: Menu bar summary
@@ -664,6 +851,42 @@ final class AccountStoreTests: XCTestCase {
         await harness.store.refresh(account: account, force: false)
 
         XCTAssertEqual(harness.store.menuBarText, "!%")
+    }
+
+    // MARK: Best-account hint wiring
+
+    func testBestBadgesArePaceAwareEndToEnd() async throws {
+        // Two Claude accounts: acct-1 has more headroom (40% vs 55%) but its
+        // synthetic ramp burns 30%/h (≈2 h of runway); acct-2 burns 3%/h
+        // (≈15 h). The store must compute projections from its injected
+        // history store and hand the badge — and the tooltip date — to the
+        // slower burner, even though v1 headroom favours acct-1.
+        let fast = makeAccount(id: "acct-1")
+        let slow = makeAccount(id: "acct-2", email: "other@example.com")
+        let provider = ProviderFake()
+        provider.setFetchResult(
+            .success(makeSessionSnapshot(percent: 40)), forAccount: fast.id)
+        provider.setFetchResult(
+            .success(makeSessionSnapshot(percent: 55)), forAccount: slow.id)
+        let harness = makeHarness(
+            provider: provider, accounts: [fast, slow],
+            vault: [fast.id: makeTokens(), slow.id: makeTokens()])
+        seedSessionRamp(
+            directory: harness.historyDirectory, account: fast.id,
+            endPercent: 40, ratePerHour: 30)
+        seedSessionRamp(
+            directory: harness.historyDirectory, account: slow.id,
+            endPercent: 55, ratePerHour: 3)
+
+        await harness.store.refresh(account: fast, force: false)
+        await harness.store.refresh(account: slow, force: false)
+
+        let badges = harness.store.bestBadges
+        XCTAssertEqual(Set(badges.keys), [slow.id])
+        // (100 − 55) / 3%/h = 15 h out; generous slack for slow CI runs.
+        let projected = try XCTUnwrap(badges[slow.id]?.projectedExhaustion)
+        let expected = Date().addingTimeInterval(15 * 3600)
+        XCTAssertEqual(projected.timeIntervalSince(expected), 0, accuracy: 900)
     }
 
     // MARK: Notifier wiring

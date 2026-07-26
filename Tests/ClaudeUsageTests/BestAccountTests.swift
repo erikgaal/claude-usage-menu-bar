@@ -8,9 +8,13 @@ import XCTest
 @MainActor
 final class BestAccountTests: XCTestCase {
 
-    /// Fixed reset time (2033-05-18T03:33:20Z). The ranking never reads it,
-    /// but realistic fixtures keep the tests honest about the shape of data.
+    /// Fixed reset time (2033-05-18T03:33:20Z). The v1 ranking never read
+    /// it; the v2 pace override does — a projection landing at/after it
+    /// counts as outlasting the window.
     private static let resetDate = Date(timeIntervalSince1970: 2_000_000_000)
+    /// Fixed "now", four hours before the session resets — a realistic spot
+    /// inside a 5-hour window — so projections relative to both are stable.
+    private static let now = resetDate.addingTimeInterval(-4 * 3600)
 
     // MARK: Fixtures
 
@@ -50,14 +54,81 @@ final class BestAccountTests: XCTestCase {
         return state
     }
 
+    /// Claude-shaped state whose session window resets `resetIn` seconds
+    /// after the fixed `now` (negative = already reset), for the v3
+    /// expiring-capacity fixtures.
+    private func makeState(
+        session: Double, resetIn: TimeInterval, needsReauth: Bool = false
+    ) -> AccountDisplayState {
+        makeState(
+            limits: [
+                LimitStatus(
+                    id: "session|", name: "Session", percent: session,
+                    resetsAt: Self.now.addingTimeInterval(resetIn),
+                    isActive: false, sortOrder: 0),
+                makeLimit(id: "weekly_all|", name: "Weekly", percent: 50, sortOrder: 1),
+            ],
+            needsReauth: needsReauth)
+    }
+
+    /// Claude-shaped state whose session window has no reset timestamp — an
+    /// idle window the API reports without a deadline.
+    private func makeIdleSessionState(session: Double) -> AccountDisplayState {
+        makeState(limits: [
+            LimitStatus(
+                id: "session|", name: "Session", percent: session,
+                resetsAt: nil, isActive: false, sortOrder: 0),
+            makeLimit(id: "weekly_all|", name: "Weekly", percent: 50, sortOrder: 1),
+        ])
+    }
+
     /// Runs the ranking over (account, state) pairs; a nil state models an
     /// account the store hasn't heard from at all.
-    private func winners(_ pairs: [(AccountMeta, AccountDisplayState?)]) -> Set<String> {
+    private func winners(
+        _ pairs: [(AccountMeta, AccountDisplayState?)],
+        projections: [String: Date] = [:],
+        rates: [String: Double] = [:],
+        multipliers: [String: Double] = [:],
+        detected: [String: Double] = [:]
+    ) -> Set<String> {
+        Set(
+            badges(
+                pairs, projections: projections, rates: rates,
+                multipliers: multipliers, detected: detected
+            ).keys)
+    }
+
+    /// Same run, but keeping the full verdicts for tooltip assertions.
+    private func badges(
+        _ pairs: [(AccountMeta, AccountDisplayState?)],
+        projections: [String: Date] = [:],
+        rates: [String: Double] = [:],
+        multipliers: [String: Double] = [:],
+        detected: [String: Double] = [:]
+    ) -> [String: BestAccount.Badge] {
         var states: [String: AccountDisplayState] = [:]
         for (account, state) in pairs {
             states[account.id] = state
         }
-        return BestAccount.winners(accounts: pairs.map(\.0), states: states)
+        return BestAccount.winners(
+            accounts: pairs.map(\.0), states: states,
+            sessionProjections: projections, sessionBurnRates: rates,
+            quotas: quotas(manual: multipliers, detected: detected), now: Self.now)
+    }
+
+    /// Builds the quota input the way `AccountStore` does: manual choices
+    /// win over detected tiers.
+    private func quotas(
+        manual: [String: Double], detected: [String: Double]
+    ) -> [String: BestAccount.Quota] {
+        var quotas: [String: BestAccount.Quota] = [:]
+        for (id, multiplier) in detected {
+            quotas[id] = BestAccount.Quota(multiplier: multiplier, source: .detected)
+        }
+        for (id, multiplier) in manual {
+            quotas[id] = BestAccount.Quota(multiplier: multiplier, source: .manual)
+        }
+        return quotas
     }
 
     // MARK: Group size
@@ -278,5 +349,950 @@ final class BestAccountTests: XCTestCase {
             (makeAccount("codex-b", provider: .codex), makeState(session: 99)),
         ])
         XCTAssertEqual(result, ["codex-a"])
+    }
+
+    // MARK: Pace override (v2)
+
+    /// A projection `interval` seconds after the fixed "now".
+    private func projection(_ interval: TimeInterval) -> Date {
+        Self.now.addingTimeInterval(interval)
+    }
+
+    func testRunnerUpOutlastingWinnerTakesBadge() {
+        // a has the most headroom, but at its pace it dies in 30 minutes
+        // while b lasts two hours — the badge follows the longer-lasting
+        // account, and the tooltip carries b's projection.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(1800), "b": projection(2 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["b"])
+        XCTAssertEqual(result["b"]?.projectedExhaustion, projection(2 * 3600))
+    }
+
+    func testWinnerKeepsBadgeAndTooltipWhenPaceAgrees() {
+        // The headroom winner also lasts longer: no override, and its own
+        // projection feeds the tooltip.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(3 * 3600), "b": projection(3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertEqual(result["a"]?.projectedExhaustion, projection(3 * 3600))
+    }
+
+    func testOverrideAtExactMarginMoves() {
+        // b outlasts a by exactly 30 minutes — the override margin is
+        // inclusive, like the v1 headroom margin.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(3600), "b": projection(3600 + 1800)])
+        XCTAssertEqual(Set(result.keys), ["b"])
+    }
+
+    func testJustUnderOverrideMarginStaysWithHeadroomWinner() {
+        // 29m59s of extra runway is forecast noise, not a reason to move.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(3600), "b": projection(3600 + 1799)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertEqual(result["a"]?.projectedExhaustion, projection(3600))
+    }
+
+    func testWinnerWithoutProjectionKeepsBadge() {
+        // a is idle (no projection) while b is projected five hours out. Nil
+        // means "not currently burning" — no pace signal — never "exhausts
+        // immediately"; reading it that way would hand b the badge here.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["b": projection(5 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    func testRunnerUpWithoutProjectionKeepsV1Winner() {
+        // a is dying fast, but idle b offers no pace signal to compare
+        // against — the headroom verdict stands, tooltip still time-based.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(1800)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertEqual(result["a"]?.projectedExhaustion, projection(1800))
+    }
+
+    func testNoProjectionsIsPureV1() {
+        let result = badges([
+            (makeAccount("a"), makeState(session: 40)),
+            (makeAccount("b"), makeState(session: 55)),
+        ])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    func testOverrideNeverResurrectsVetoedAccount() {
+        // b would outlast everyone, but its sign-in is dead — vetoed accounts
+        // drop out before the pace comparison. The eligible runner-up c has
+        // no projection, so a keeps the badge.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55, needsReauth: true)),
+                (makeAccount("c"), makeState(session: 70)),
+            ],
+            projections: ["a": projection(1800), "b": projection(6 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+    }
+
+    func testOverrideRespectsWeeklyVeto() {
+        // Same shape with the weekly-exhaustion veto: b's long runway is a
+        // mirage when its week is spent.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55, weekly: 99.5)),
+                (makeAccount("c"), makeState(session: 70)),
+            ],
+            projections: ["a": projection(1800), "b": projection(6 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+    }
+
+    func testOverrideDoesNotCrossProviders() {
+        // Codex's loser has by far the longest runway, but each provider's
+        // override weighs only its own candidates: the Claude runner-up is
+        // 20 minutes of extra runway short of an override, while the Codex
+        // pair does flip on pace.
+        let result = winners(
+            [
+                (makeAccount("claude-a"), makeState(session: 20)),
+                (makeAccount("claude-b"), makeState(session: 70)),
+                (makeAccount("codex-c", provider: .codex), makeState(session: 10)),
+                (makeAccount("codex-d", provider: .codex), makeState(session: 90)),
+            ],
+            projections: [
+                "claude-a": projection(1800),
+                "claude-b": projection(1800 + 600),
+                "codex-c": projection(3600),
+                "codex-d": projection(3 * 3600),
+            ])
+        XCTAssertEqual(result, ["claude-a", "codex-d"])
+    }
+
+    func testSingleAccountWithProjectionStillNotBadged() {
+        // The group-size rule survives v2: pace data doesn't make a lone
+        // account comparable to nothing.
+        let result = badges(
+            [(makeAccount("a"), makeState(session: 5))],
+            projections: ["a": projection(3600)])
+        XCTAssertTrue(result.isEmpty)
+    }
+
+    func testPastProjectionIsNoSignal() {
+        // a's projection is 10 minutes ago: stale history, not "already
+        // dead" — a truly exhausted session shows in its percent, which the
+        // ranking already sees. With no usable signal on a the override
+        // can't fire, and the tooltip stays static.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: ["a": projection(-600), "b": projection(2 * 3600)])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    func testProjectionBeyondResetCountsAsOutlastingTheWindow() {
+        // b's projected exhaustion lands after its session resets — at the
+        // current pace it never runs out this window, which beats a's
+        // 30-minute runway. There's no honest duration to show for "outlasts
+        // the window", so the tooltip stays static.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: [
+                "a": projection(1800),
+                "b": Self.resetDate.addingTimeInterval(3600),
+            ])
+        XCTAssertEqual(Set(result.keys), ["b"])
+        XCTAssertNil(result["b"]?.projectedExhaustion)
+    }
+
+    func testWinnerProjectionBeyondResetKeepsBadgeWithStaticTooltip() {
+        // The winner outlasts its whole window; the runner-up dying sooner is
+        // no reason to move, and the post-reset date is not shown.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: [
+                "a": Self.resetDate.addingTimeInterval(3600),
+                "b": projection(1800),
+            ])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    func testBothProjectionsBeyondResetKeepV1Winner() {
+        // Neither account runs out this window: pace has nothing to add, so
+        // the headroom verdict stands with the static tooltip.
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ],
+            projections: [
+                "a": Self.resetDate.addingTimeInterval(3600),
+                "b": Self.resetDate.addingTimeInterval(2 * 3600),
+            ])
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertNil(result["a"]?.projectedExhaustion)
+    }
+
+    // MARK: Evaluation trace (debug view)
+
+    /// Full traces over the same fixture shape the `winners` helper uses.
+    private func traces(
+        _ pairs: [(AccountMeta, AccountDisplayState?)],
+        projections: [String: Date] = [:],
+        rates: [String: Double] = [:],
+        multipliers: [String: Double] = [:],
+        detected: [String: Double] = [:]
+    ) -> [BestAccount.GroupTrace] {
+        var states: [String: AccountDisplayState] = [:]
+        for (account, state) in pairs {
+            states[account.id] = state
+        }
+        return BestAccount.evaluate(
+            accounts: pairs.map(\.0), states: states,
+            sessionProjections: projections, sessionBurnRates: rates,
+            quotas: quotas(manual: multipliers, detected: detected), now: Self.now)
+    }
+
+    private func candidate(
+        _ id: String, in trace: BestAccount.GroupTrace
+    ) -> BestAccount.CandidateTrace? {
+        trace.candidates.first { $0.accountID == id }
+    }
+
+    private func award(
+        of trace: BestAccount.GroupTrace,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> BestAccount.Award {
+        guard case .badged(let award) = trace.decision else {
+            XCTFail("expected a badge, got \(trace.decision)", file: file, line: line)
+            throw XCTSkip("no award to inspect")
+        }
+        return award
+    }
+
+    func testTraceRecordsEachVetoReason() throws {
+        // Every veto kind side by side; a survives as the sole eligible
+        // account, and the trace still lists everyone with a reason.
+        let trace = try XCTUnwrap(
+            traces([
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 5, needsReauth: true)),
+                (makeAccount("c"), makeState(limits: [])),
+                (makeAccount("d"), nil),
+                (makeAccount("e"), makeState(session: 10, weekly: 99.8)),
+            ]).first)
+        XCTAssertEqual(candidate("a", in: trace)?.eligibility, .eligible)
+        XCTAssertEqual(candidate("a", in: trace)?.sessionPercent, 40)
+        XCTAssertEqual(candidate("a", in: trace)?.sessionName, "Session")
+        XCTAssertEqual(candidate("b", in: trace)?.eligibility, .vetoedNeedsReauth)
+        XCTAssertEqual(candidate("c", in: trace)?.eligibility, .vetoedNoData)
+        XCTAssertEqual(candidate("d", in: trace)?.eligibility, .vetoedNoData)
+        XCTAssertEqual(
+            candidate("e", in: trace)?.eligibility,
+            .vetoedWeeklyExhausted(limitName: "Weekly", percent: 99.8))
+
+        let award = try award(of: trace)
+        XCTAssertEqual(award.badgedID, "a")
+        XCTAssertNil(award.headroomGap)
+        XCTAssertEqual(award.paceComparison, .soleCandidate)
+        XCTAssertFalse(award.overrideApplied)
+    }
+
+    func testTraceMarginNumbersMatchBadgedDecision() throws {
+        let trace = try XCTUnwrap(
+            traces([
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ]).first)
+        let award = try award(of: trace)
+        XCTAssertEqual(award.headroomWinnerID, "a")
+        XCTAssertEqual(award.headroomGap, 15)
+        XCTAssertEqual(award.paceComparison, .missingSignal)
+        XCTAssertEqual(award.badgedID, "a")
+        XCTAssertFalse(award.overrideApplied)
+        XCTAssertNil(award.badge.projectedExhaustion)
+    }
+
+    func testTraceMarginTooCloseCarriesNumbers() throws {
+        let trace = try XCTUnwrap(
+            traces([
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 45)),
+            ]).first)
+        XCTAssertEqual(
+            trace.decision, .marginTooClose(winnerID: "a", runnerUpID: "b", gap: 5))
+    }
+
+    func testTraceOverrideAppliedCarriesDelta() throws {
+        // b outlasts a by two hours: the delta, the moved badge, and the
+        // tooltip payload all live in the award.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeState(session: 40)),
+                    (makeAccount("b"), makeState(session: 55)),
+                ],
+                projections: ["a": projection(3600), "b": projection(3 * 3600)]
+            ).first)
+        let award = try award(of: trace)
+        XCTAssertEqual(award.headroomWinnerID, "a")
+        XCTAssertEqual(award.paceComparison, .delta(2 * 3600))
+        XCTAssertTrue(award.overrideApplied)
+        XCTAssertEqual(award.badgedID, "b")
+        XCTAssertEqual(award.badge.projectedExhaustion, projection(3 * 3600))
+    }
+
+    func testTraceOverrideWithheldCarriesDelta() throws {
+        // 15 minutes of extra runway is under the margin: the trace still
+        // records the exact delta the decision was made on.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeState(session: 40)),
+                    (makeAccount("b"), makeState(session: 55)),
+                ],
+                projections: ["a": projection(3600), "b": projection(3600 + 900)]
+            ).first)
+        let award = try award(of: trace)
+        XCTAssertEqual(award.paceComparison, .delta(900))
+        XCTAssertFalse(award.overrideApplied)
+        XCTAssertEqual(award.badgedID, "a")
+        XCTAssertEqual(award.badge.projectedExhaustion, projection(3600))
+    }
+
+    func testTraceRunnerUpBeyondResetComparison() throws {
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeState(session: 40)),
+                    (makeAccount("b"), makeState(session: 55)),
+                ],
+                projections: [
+                    "a": projection(1800),
+                    "b": Self.resetDate.addingTimeInterval(3600),
+                ]
+            ).first)
+        XCTAssertEqual(candidate("b", in: trace)?.pace, .beyondReset)
+        let award = try award(of: trace)
+        XCTAssertEqual(award.paceComparison, .runnerUpOutlastsWindow)
+        XCTAssertTrue(award.overrideApplied)
+        XCTAssertEqual(award.badgedID, "b")
+        XCTAssertNil(award.badge.projectedExhaustion)
+    }
+
+    func testTraceWinnerBeyondResetComparison() throws {
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeState(session: 40)),
+                    (makeAccount("b"), makeState(session: 55)),
+                ],
+                projections: [
+                    "a": Self.resetDate.addingTimeInterval(3600),
+                    "b": projection(1800),
+                ]
+            ).first)
+        let award = try award(of: trace)
+        XCTAssertEqual(award.paceComparison, .winnerOutlastsWindow)
+        XCTAssertFalse(award.overrideApplied)
+        XCTAssertEqual(award.badgedID, "a")
+        XCTAssertNil(award.badge.projectedExhaustion)
+    }
+
+    func testTraceGroupTooSmall() throws {
+        let trace = try XCTUnwrap(
+            traces([(makeAccount("a"), makeState(session: 5))]).first)
+        XCTAssertEqual(trace.decision, .groupTooSmall)
+        // The lone account is still fully traced for the debug view.
+        XCTAssertEqual(candidate("a", in: trace)?.sessionPercent, 5)
+    }
+
+    func testTraceAllVetoed() throws {
+        let trace = try XCTUnwrap(
+            traces([
+                (makeAccount("a"), makeState(session: 10, needsReauth: true)),
+                (makeAccount("b"), nil),
+            ]).first)
+        XCTAssertEqual(trace.decision, .allVetoed)
+    }
+
+    func testTracePaceSignalKinds() throws {
+        // All four signal kinds side by side: a real projection, a stale
+        // (past) one, none at all, and one landing past the session reset.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeState(session: 10)),
+                    (makeAccount("b"), makeState(session: 30)),
+                    (makeAccount("c"), makeState(session: 50)),
+                    (makeAccount("d"), makeState(session: 70)),
+                ],
+                projections: [
+                    "a": projection(3600),
+                    "b": projection(-600),
+                    "d": Self.resetDate.addingTimeInterval(10),
+                ]
+            ).first)
+        XCTAssertEqual(candidate("a", in: trace)?.pace, .projected(projection(3600)))
+        XCTAssertEqual(candidate("b", in: trace)?.pace, .stale)
+        XCTAssertEqual(candidate("c", in: trace)?.pace, .noProjection)
+        XCTAssertEqual(candidate("d", in: trace)?.pace, .beyondReset)
+    }
+
+    /// Fixture spread shared by the derivation and zero-pace property
+    /// tests: v1/v2 shapes plus one v3 (expiring-first) shape.
+    private func derivationFixtures() -> [(
+        pairs: [(AccountMeta, AccountDisplayState?)],
+        projections: [String: Date],
+        rates: [String: Double]
+    )] {
+        [
+            // plain v1 winner
+            ([
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ], [:], [:]),
+            // pace override applied
+            ([
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ], ["a": projection(1800), "b": projection(2 * 3600)], [:]),
+            // margin too close: no badge
+            ([
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 45)),
+            ], [:], [:]),
+            // two providers, vetoes, and a beyond-reset runner-up
+            ([
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+                (makeAccount("c"), makeState(session: 5, needsReauth: true)),
+                (makeAccount("x", provider: .codex), makeState(session: 10)),
+                (makeAccount("y", provider: .codex), makeState(session: 90)),
+            ], [
+                "a": projection(1800),
+                "b": Self.resetDate.addingTimeInterval(3600),
+                "x": projection(3600),
+            ], [:]),
+            // lone account: no badge
+            ([(makeAccount("a"), makeState(session: 5))], ["a": projection(3600)], [:]),
+            // all vetoed: no badge
+            ([
+                (makeAccount("a"), makeState(session: 10, needsReauth: true)),
+                (makeAccount("b"), nil),
+            ], [:], [:]),
+            // v3 expiring-first: issue #19's worked example
+            ([
+                (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+                (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+            ], [:], ["work": 35, "personal": 25]),
+        ]
+    }
+
+    func testWinnersMatchTraceDerivationAcrossFixtures() {
+        // Property-style check: for a spread of fixture shapes, the badge
+        // map `winners` returns is exactly the set of badge-awarding
+        // decisions in the traces — the debug view and the badge can never
+        // disagree.
+        for (pairs, projections, rates) in derivationFixtures() {
+            var derived: [String: BestAccount.Badge] = [:]
+            for trace in traces(pairs, projections: projections, rates: rates) {
+                switch trace.decision {
+                case .badged(let award):
+                    derived[award.badgedID] = award.badge
+                case .expiringFirst(let award):
+                    derived[award.badgedID] = award.badge
+                case .groupTooSmall, .allVetoed, .marginTooClose:
+                    break
+                }
+            }
+            XCTAssertEqual(
+                badges(pairs, projections: projections, rates: rates), derived,
+                "winners must be exactly the traces' badge-awarding decisions")
+        }
+    }
+
+    // MARK: Expiring-capacity ranking (v3, issue #19)
+
+    func testIssue19WorkedExampleBadgesWork() {
+        // The issue's flagship example: Work at 60% (40 points of headroom)
+        // resets in 1 h, Personal at 30% (70 points) resets in 4 h, combined
+        // pace 60%/h. Headroom favours Personal, but Work's 40 points vanish
+        // at 1:00 while Personal's will be needed anyway — badge Work, and
+        // say why in the tooltip payload.
+        let result = badges(
+            [
+                (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+                (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+            ],
+            rates: ["work": 35, "personal": 25])
+        XCTAssertEqual(Set(result.keys), ["work"])
+        XCTAssertEqual(
+            result["work"]?.expiring,
+            BestAccount.ExpiringCapacity(
+                points: 40, resetsAt: Self.now.addingTimeInterval(3600)))
+        XCTAssertNil(result["work"]?.projectedExhaustion)
+    }
+
+    func testAtRiskCapsAtHeadroom() throws {
+        // a's reset is an hour out with 60%/h of group demand — more than
+        // its 40 points of headroom, so headroom is the binding cap.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeState(session: 60, resetIn: 3600)),
+                    (makeAccount("b"), makeState(session: 10, resetIn: 4 * 3600)),
+                ],
+                rates: ["a": 35, "b": 25]
+            ).first)
+        XCTAssertEqual(candidate("a", in: trace)?.atRiskPercent, 40)
+        // b is the reserve: the demand its reset leaves uncovered lands on
+        // it regardless, so nothing of b's is at risk.
+        XCTAssertEqual(candidate("b", in: trace)?.atRiskPercent, 0)
+    }
+
+    func testAtRiskCapsAtDemandBeforeReset() throws {
+        // Only half an hour to a's reset: 60%/h can consume 30 points at
+        // most, well under a's 80 points of headroom — demand is the cap.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeState(session: 20, resetIn: 1800)),
+                    (makeAccount("b"), makeState(session: 10, resetIn: 4 * 3600)),
+                ],
+                rates: ["a": 60]
+            ).first)
+        XCTAssertEqual(candidate("a", in: trace)?.atRiskPercent, 30)
+        let result = badges(
+            [
+                (makeAccount("a"), makeState(session: 20, resetIn: 1800)),
+                (makeAccount("b"), makeState(session: 10, resetIn: 4 * 3600)),
+            ],
+            rates: ["a": 60])
+        XCTAssertEqual(result["a"]?.expiring?.points, 30)
+    }
+
+    func testIdleOrExpiredWindowsHaveNothingAtRisk() throws {
+        // a's window has no deadline, b's has already reset: neither has
+        // anything expiring, so the live account c carries all the risk.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeIdleSessionState(session: 10)),
+                    (makeAccount("b"), makeState(session: 20, resetIn: -600)),
+                    (makeAccount("c"), makeState(session: 60, resetIn: 3600)),
+                ],
+                rates: ["a": 20, "b": 20, "c": 20]
+            ).first)
+        XCTAssertEqual(candidate("a", in: trace)?.atRiskPercent, 0)
+        XCTAssertEqual(candidate("b", in: trace)?.atRiskPercent, 0)
+        XCTAssertEqual(candidate("c", in: trace)?.atRiskPercent, 40)
+        guard case .expiringFirst(let award) = trace.decision else {
+            return XCTFail("expected expiring-first, got \(trace.decision)")
+        }
+        XCTAssertEqual(award.badgedID, "c")
+    }
+
+    func testAtRiskFloorBoundary() {
+        // 10%/h against a 30-minute reset puts exactly 5 points at risk —
+        // the inclusive floor — so expiring-first fires for a even though b
+        // has far more headroom.
+        let atFloor = badges(
+            [
+                (makeAccount("a"), makeState(session: 20, resetIn: 1800)),
+                (makeAccount("b"), makeIdleSessionState(session: 10)),
+            ],
+            rates: ["a": 10])
+        XCTAssertEqual(Set(atFloor.keys), ["a"])
+        XCTAssertEqual(atFloor["a"]?.expiring?.points, 5)
+
+        // A minute less runway (≈4.8 points at risk) drops under the floor:
+        // v2 wholesale takes over and badges b on headroom instead.
+        let underFloor = badges(
+            [
+                (makeAccount("a"), makeState(session: 20, resetIn: 1740)),
+                (makeAccount("b"), makeIdleSessionState(session: 10)),
+            ],
+            rates: ["a": 10])
+        XCTAssertEqual(Set(underFloor.keys), ["b"])
+        XCTAssertNil(underFloor["b"]?.expiring)
+    }
+
+    func testAtRiskMarginBoundary() throws {
+        // At 10%/h of pooled demand, a has 10 points at risk (1 h to reset)
+        // and b has 5 (30 min): a gap of exactly 0.05 units — inclusive —
+        // moves the badge to a.
+        let atMargin = badges(
+            [
+                (makeAccount("a"), makeState(session: 30, resetIn: 3600)),
+                (makeAccount("b"), makeState(session: 40, resetIn: 1800)),
+            ],
+            rates: ["a": 10])
+        XCTAssertEqual(Set(atMargin.keys), ["a"])
+        XCTAssertEqual(
+            try XCTUnwrap(atMargin["a"]?.expiring?.points), 10, accuracy: 1e-9)
+
+        // Stretching b's reset to 33 min lifts its at-risk to 5.5 points:
+        // the gap (0.045 units) is under the margin, so v2 decides — a
+        // still wins, but on headroom, with no expiring payload.
+        let underMargin = badges(
+            [
+                (makeAccount("a"), makeState(session: 30, resetIn: 3600)),
+                (makeAccount("b"), makeState(session: 40, resetIn: 1980)),
+            ],
+            rates: ["a": 10])
+        XCTAssertEqual(Set(underMargin.keys), ["a"])
+        XCTAssertNil(underMargin["a"]?.expiring)
+    }
+
+    func testExpiringFirstNeverBadgesVetoedAccounts() throws {
+        // b's window expires soonest with plenty of headroom, but its
+        // sign-in is dead: it must not be badged, must not rank, and must
+        // not count as coverage — a's at-risk is 10 (60 of demand minus
+        // c's 30 points of cover), not the 40 it would be if b's 90 points
+        // wrongly counted.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("a"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("b"), makeState(session: 10, resetIn: 1800, needsReauth: true)),
+            (makeAccount("c"), makeState(session: 70, resetIn: 4 * 3600)),
+        ]
+        let rates = ["a": 30.0, "b": 20.0, "c": 10.0]
+        let trace = try XCTUnwrap(traces(pairs, rates: rates).first)
+        XCTAssertNil(candidate("b", in: trace)?.atRiskPercent)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("a", in: trace)?.atRiskPercent), 10, accuracy: 1e-9)
+        let result = badges(pairs, rates: rates)
+        XCTAssertEqual(Set(result.keys), ["a"])
+        XCTAssertEqual(
+            try XCTUnwrap(result["a"]?.expiring?.points), 10, accuracy: 1e-9)
+    }
+
+    func testZeroAggregatePaceMatchesV2AcrossFixtures() {
+        // The fallback proof, property-style: zeroed (and clamped-negative)
+        // burn rates must reproduce the no-rates verdict bit for bit on
+        // every fixture shape — v3 with no demand signal IS v2.
+        for (pairs, projections, _) in derivationFixtures() {
+            let baseline = badges(pairs, projections: projections)
+            let zeroed = Dictionary(
+                uniqueKeysWithValues: pairs.enumerated().map { index, pair in
+                    (pair.0.id, index.isMultiple(of: 2) ? 0.0 : -3.0)
+                })
+            XCTAssertEqual(
+                badges(pairs, projections: projections, rates: zeroed), baseline,
+                "zero aggregate pace must fall back to v2 wholesale")
+        }
+    }
+
+    func testTraceExpiringFirstPathContents() throws {
+        // The debug view's numbers for the worked example: the aggregate,
+        // both at-risk values, the award with its gap, and no fallback.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+                    (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+                ],
+                rates: ["work": 35, "personal": 25]
+            ).first)
+        // 60 pp/h at equal weights pools to 0.60 units/h; Work's 40 pp at
+        // risk is 0.40 units.
+        XCTAssertEqual(trace.aggregatePace, 0.6, accuracy: 1e-12)
+        XCTAssertEqual(trace.quotaWeighting, .equalWeightsAssumed)
+        XCTAssertEqual(candidate("work", in: trace)?.atRiskPercent, 40)
+        XCTAssertEqual(try XCTUnwrap(candidate("work", in: trace)?.atRiskUnits), 0.4, accuracy: 1e-12)
+        XCTAssertEqual(candidate("personal", in: trace)?.atRiskPercent, 0)
+        XCTAssertNil(trace.capacityFallback)
+        guard case .expiringFirst(let award) = trace.decision else {
+            return XCTFail("expected expiring-first, got \(trace.decision)")
+        }
+        XCTAssertEqual(award.badgedID, "work")
+        XCTAssertEqual(award.atRiskUnits, 0.4, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(award.atRiskGapUnits), 0.4, accuracy: 1e-12)
+        XCTAssertEqual(try XCTUnwrap(award.badge.expiring?.points), 40, accuracy: 1e-9)
+        XCTAssertEqual(
+            award.badge.expiring?.resetsAt, Self.now.addingTimeInterval(3600))
+    }
+
+    func testTraceFallbackReasons() throws {
+        // No rates at all: no demand signal, v2 decides.
+        let noPace = try XCTUnwrap(
+            traces([
+                (makeAccount("a"), makeState(session: 40)),
+                (makeAccount("b"), makeState(session: 55)),
+            ]).first)
+        XCTAssertEqual(noPace.aggregatePace, 0)
+        XCTAssertEqual(noPace.capacityFallback, .noAggregatePace)
+        guard case .badged = noPace.decision else {
+            return XCTFail("expected a v2 badge, got \(noPace.decision)")
+        }
+
+        // Pace flows but both windows are idle: nothing at stake.
+        let idle = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeIdleSessionState(session: 40)),
+                    (makeAccount("b"), makeIdleSessionState(session: 55)),
+                ],
+                rates: ["a": 30, "b": 30]
+            ).first)
+        XCTAssertEqual(idle.capacityFallback, .belowFloor(topAtRiskUnits: 0))
+
+        // Both accounts have real but near-equal at-risk: the strategies
+        // tie, and the trace records who was compared and by how much.
+        let close = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("a"), makeState(session: 30, resetIn: 2700)),
+                    (makeAccount("b"), makeState(session: 40, resetIn: 1980)),
+                ],
+                rates: ["a": 10, "b": 10]
+            ).first)
+        guard case .atRiskTooClose(let leaderID, let runnerUpID, let gapUnits) =
+            close.capacityFallback
+        else {
+            return XCTFail("expected atRiskTooClose, got \(String(describing: close.capacityFallback))")
+        }
+        XCTAssertEqual(leaderID, "a")
+        XCTAssertEqual(runnerUpID, "b")
+        // 4 pp at equal weights = 0.04 units.
+        XCTAssertEqual(gapUnits, 0.04, accuracy: 1e-9)
+        guard case .badged(let award) = close.decision else {
+            return XCTFail("expected a v2 badge, got \(close.decision)")
+        }
+        XCTAssertEqual(award.badgedID, "a")
+    }
+
+    // MARK: Quota-weighted shared pool
+
+    func testUnitConversionMixedTiers() throws {
+        // Hand-computed mixed-tier example. Work is Max 20× at 60% session
+        // (40% headroom = 8.0 units), resets in 1 h; Personal is Pro at 30%
+        // (70% headroom = 0.7 units), resets in 4 h. Rates: Work 30 pp/h ×20
+        // = 6.0 units/h, Personal 10 pp/h ×1 = 0.1 → pool 6.1 units/h.
+        // Work: demand 6.1, savable min(8, 6.1) = 6.1, coverage 0.7 →
+        // inevitable 5.4 → at-risk 0.7 units = 3.5% of its own window.
+        // Personal: savable 0.7, all inevitable → 0. Badge Work.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let rates = ["work": 30.0, "personal": 10.0]
+        let mults = ["work": 20.0, "personal": 1.0]
+        let trace = try XCTUnwrap(traces(pairs, rates: rates, multipliers: mults).first)
+        XCTAssertEqual(trace.quotaWeighting, .quotaWeighted)
+        XCTAssertEqual(trace.aggregatePace, 6.1, accuracy: 1e-12)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("work", in: trace)?.atRiskUnits), 0.7, accuracy: 1e-9)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("work", in: trace)?.atRiskPercent), 3.5, accuracy: 1e-9)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("personal", in: trace)?.atRiskUnits), 0, accuracy: 1e-9)
+        let result = badges(pairs, rates: rates, multipliers: mults)
+        XCTAssertEqual(Set(result.keys), ["work"])
+        XCTAssertEqual(try XCTUnwrap(result["work"]?.expiring?.points), 3.5, accuracy: 1e-9)
+    }
+
+    func testPoolStabilityAcrossAccountSizes() throws {
+        // The same absolute workload must pool identically whether it shows
+        // up as a fast percent-burn on a small account or a slow one on a
+        // big account: 60 pp/h on Pro == 3 pp/h on Max 20× == 0.6 units/h.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("big"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("small"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let mults = ["big": 20.0, "small": 1.0]
+        let onSmall = try XCTUnwrap(
+            traces(pairs, rates: ["small": 60], multipliers: mults).first)
+        let onBig = try XCTUnwrap(
+            traces(pairs, rates: ["big": 3], multipliers: mults).first)
+        XCTAssertEqual(onSmall.aggregatePace, 0.6, accuracy: 1e-12)
+        XCTAssertEqual(onBig.aggregatePace, onSmall.aggregatePace)
+    }
+
+    func testUnknownMultiplierFallsBackToEqualWeights() {
+        // Honesty rule, property-style: setting every multiplier except the
+        // first account's must reproduce the all-unknown verdict bit for
+        // bit — silently mixing known and unknown weights is worse than
+        // assuming equality.
+        for (pairs, projections, rates) in derivationFixtures() {
+            let baseline = badges(pairs, projections: projections, rates: rates)
+            var partial: [String: Double] = [:]
+            for (account, _) in pairs.dropFirst() { partial[account.id] = 20 }
+            XCTAssertEqual(
+                badges(pairs, projections: projections, rates: rates, multipliers: partial),
+                baseline,
+                "one unknown plan must force the whole group onto equal weights")
+        }
+    }
+
+    func testUnknownMultiplierIsAnnotatedInTrace() throws {
+        // The debug view must be able to say "plans not set — assuming
+        // equal quotas" whenever the honesty rule downgraded the pool.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let rates = ["work": 35.0, "personal": 25.0]
+        let partial = try XCTUnwrap(
+            traces(pairs, rates: rates, multipliers: ["work": 20]).first)
+        XCTAssertEqual(partial.quotaWeighting, .equalWeightsAssumed)
+        // The supplied multiplier is still visible per account…
+        XCTAssertEqual(
+            candidate("work", in: partial)?.quota,
+            BestAccount.Quota(multiplier: 20, source: .manual))
+        XCTAssertNil(candidate("personal", in: partial)?.quota)
+        // …but the math ran unweighted: identical to no multipliers at all.
+        let unweighted = try XCTUnwrap(traces(pairs, rates: rates).first)
+        XCTAssertEqual(partial.aggregatePace, unweighted.aggregatePace)
+        XCTAssertEqual(partial.decision, unweighted.decision)
+    }
+
+    func testAllKnownVersusAllUnknownBoundary() throws {
+        // All-known ×1 runs the weighted pool (same numbers as equal
+        // weights, different annotation); all-unknown assumes equality.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let rates = ["work": 35.0, "personal": 25.0]
+        let known = try XCTUnwrap(
+            traces(pairs, rates: rates, multipliers: ["work": 1, "personal": 1]).first)
+        let unknown = try XCTUnwrap(traces(pairs, rates: rates).first)
+        XCTAssertEqual(known.quotaWeighting, .quotaWeighted)
+        XCTAssertEqual(unknown.quotaWeighting, .equalWeightsAssumed)
+        XCTAssertEqual(known.decision, unknown.decision)
+    }
+
+    func testAtRiskFloorBoundaryInUnits() {
+        // On a Max 20× account, a quarter percent of window is 0.05 units —
+        // exactly the floor, so expiring-first fires even though the
+        // percent numbers look negligible; a whisker less falls back to v2
+        // (which badges idle b on headroom, 10% vs 20% session... margin 10).
+        let mults = ["a": 20.0, "b": 20.0]
+        let atFloor = badges(
+            [
+                // 1 pp/h × 20 = 0.2 units/h; 15 min to reset → 0.05 units.
+                (makeAccount("a"), makeState(session: 20, resetIn: 900)),
+                (makeAccount("b"), makeIdleSessionState(session: 10)),
+            ],
+            rates: ["a": 1], multipliers: mults)
+        XCTAssertEqual(Set(atFloor.keys), ["a"])
+        XCTAssertNotNil(atFloor["a"]?.expiring)
+
+        let underFloor = badges(
+            [
+                (makeAccount("a"), makeState(session: 20, resetIn: 840)),
+                (makeAccount("b"), makeIdleSessionState(session: 10)),
+            ],
+            rates: ["a": 1], multipliers: mults)
+        XCTAssertEqual(Set(underFloor.keys), ["b"])
+        XCTAssertNil(underFloor["b"]?.expiring)
+    }
+
+    func testAtRiskMarginBoundaryAcrossTiers() {
+        // Mixed tiers, demand from a third idle account: a (Pro) has
+        // 0.10 units at risk (30 min × 0.2 units/h), b (Max 5×) has 0.05 —
+        // a gap of exactly 0.05 units moves the badge to a...
+        let mults = ["a": 1.0, "b": 5.0, "c": 1.0]
+        let atMargin = badges(
+            [
+                (makeAccount("a"), makeState(session: 50, resetIn: 1800)),
+                // 0.05 units before b's reset is 1% of its ×5 window.
+                (makeAccount("b"), makeState(session: 60, resetIn: 900)),
+                (makeAccount("c"), makeIdleSessionState(session: 0)),
+            ],
+            rates: ["c": 20], multipliers: mults)
+        XCTAssertEqual(Set(atMargin.keys), ["a"])
+        XCTAssertEqual(atMargin["a"]?.expiring?.points, 10)
+
+        // …while stretching b's reset to 18 min (0.06 units) shrinks the
+        // gap to 0.04: under the margin, v2 decides (idle c wins on
+        // headroom), with the tie recorded in the trace.
+        let underMargin = badges(
+            [
+                (makeAccount("a"), makeState(session: 50, resetIn: 1800)),
+                (makeAccount("b"), makeState(session: 60, resetIn: 1080)),
+                (makeAccount("c"), makeIdleSessionState(session: 0)),
+            ],
+            rates: ["c": 20], multipliers: mults)
+        XCTAssertEqual(Set(underMargin.keys), ["c"])
+        XCTAssertNil(underMargin["c"]?.expiring)
+    }
+
+    // MARK: Detected plan tiers
+
+    func testDetectedMultipliersWeightThePool() throws {
+        // The mixed-tier example again, but every multiplier came from the
+        // profile endpoint instead of the Plan menu: detection counts as
+        // "known", so the pool is fully weighted and the verdict matches
+        // the manual-picker run exactly.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+            (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+        ]
+        let rates = ["work": 30.0, "personal": 10.0]
+        let tiers = ["work": 20.0, "personal": 1.0]
+        let trace = try XCTUnwrap(traces(pairs, rates: rates, detected: tiers).first)
+        XCTAssertEqual(trace.quotaWeighting, .quotaWeighted)
+        XCTAssertEqual(
+            candidate("work", in: trace)?.quota,
+            BestAccount.Quota(multiplier: 20, source: .detected))
+        XCTAssertEqual(
+            badges(pairs, rates: rates, detected: tiers),
+            badges(pairs, rates: rates, multipliers: tiers),
+            "detected and manual multipliers must weight the pool identically")
+    }
+
+    func testManualAndDetectedMixCountsAsFullyKnown() throws {
+        // One account hand-picked, the other auto-detected: every account
+        // has an effective multiplier, so the honesty rule is satisfied —
+        // and the trace records each source for the debug view.
+        let trace = try XCTUnwrap(
+            traces(
+                [
+                    (makeAccount("work"), makeState(session: 60, resetIn: 3600)),
+                    (makeAccount("personal"), makeState(session: 30, resetIn: 4 * 3600)),
+                ],
+                rates: ["work": 30, "personal": 10],
+                multipliers: ["work": 20],
+                detected: ["personal": 1]
+            ).first)
+        XCTAssertEqual(trace.quotaWeighting, .quotaWeighted)
+        XCTAssertEqual(candidate("work", in: trace)?.quota?.source, .manual)
+        XCTAssertEqual(candidate("personal", in: trace)?.quota?.source, .detected)
     }
 }

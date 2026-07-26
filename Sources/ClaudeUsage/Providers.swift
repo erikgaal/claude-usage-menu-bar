@@ -22,6 +22,15 @@ protocol UsageProvider: Sendable {
     func login() async throws -> LoginResult
     func refresh(tokens: StoredTokens) async throws -> StoredTokens
     func fetchUsage(accessToken: String, accountID: String) async throws -> UsageSnapshot
+    /// Plan-tier detection from the provider's profile endpoint, feeding the
+    /// quota-weighted best-account pool. Nil when the provider has no such
+    /// endpoint (the default). Callers treat every error as "unknown" and
+    /// stay silent — detection must never affect usage display or login.
+    func fetchProfile(accessToken: String) async throws -> DetectedPlan?
+}
+
+extension UsageProvider {
+    func fetchProfile(accessToken: String) async throws -> DetectedPlan? { nil }
 }
 
 enum Providers {
@@ -50,6 +59,10 @@ struct ClaudeProvider: UsageProvider {
 
     func fetchUsage(accessToken: String, accountID: String) async throws -> UsageSnapshot {
         try await UsageAPI.fetchUsage(accessToken: accessToken)
+    }
+
+    func fetchProfile(accessToken: String) async throws -> DetectedPlan? {
+        try await UsageAPI.fetchProfile(accessToken: accessToken)
     }
 }
 
