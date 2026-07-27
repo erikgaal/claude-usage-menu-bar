@@ -499,9 +499,12 @@ enum BestAccount {
         let eligibility: Eligibility
         if state?.needsReauth == true {
             eligibility = .vetoedNeedsReauth
-        } else if let state, let session {
-            if let spent = state.limits.first(where: {
-                $0.id != session.id && $0.percent >= weeklyExhaustedPercent
+        } else if let state, session != nil {
+            // Week-scoped windows only, from the same classifier the weekly
+            // leg uses: a spent five-hour sub-limit doesn't mean the week is
+            // gone, which is the whole premise of this veto.
+            if let spent = weeklyWindows(in: state.limits).first(where: {
+                $0.percent >= weeklyExhaustedPercent
             }) {
                 eligibility = .vetoedWeeklyExhausted(
                     limitName: spent.name, percent: spent.percent)
@@ -568,21 +571,24 @@ enum BestAccount {
     /// weekly-scoped windows instead of its session window, in pooled quota
     /// units of a weekly window (one full Pro week = 1.0).
     ///
-    /// Two assumptions this leg makes, both acknowledged approximations:
+    /// One rule governs both sides of the formula: **an account's weekly
+    /// capacity is bounded by its tightest weekly window.** Model-scoped usage
+    /// also lands in the overall weekly window, so whichever window runs out
+    /// first limits both how much of the week's demand an account can absorb
+    /// on someone else's behalf (its `coverage` contribution) and how much of
+    /// its own headroom prioritizing it can save (its at-risk). Both therefore
+    /// use each account's *minimum* headroom.
     ///
-    /// - **An account's non-session windows are comparable with each other.**
-    ///   The account keeps the window with the largest at-risk. `weekly_all`,
-    ///   a model-scoped window like Fable and a Codex secondary window carry
-    ///   different absolute budgets, so their percents are not strictly
-    ///   commensurable — but they share a reset cadence, which makes this far
-    ///   less wrong than comparing a session percent with a weekly one (the
-    ///   comparison v4 refuses to make at all).
-    /// - **Coverage is bounded by the other accounts' tightest weekly
-    ///   window.** How much of the week's demand another account can absorb
-    ///   instead is limited by whichever of its weekly windows runs out
-    ///   first, so coverage uses each other account's *minimum* headroom.
-    ///   Like the session leg's ignored refreshes, this errs toward a larger
-    ///   at-risk — that is, toward showing the hint.
+    /// Its consequences, both acknowledged:
+    ///
+    /// - The account still keeps the window with the largest at-risk, since
+    ///   resets differ: capacity behind an earlier reset expires sooner. Only
+    ///   the clock varies — the amount is the same bound for every window — so
+    ///   this no longer compares incommensurable budgets, it picks a deadline.
+    /// - A roomy overall weekly window sitting behind a spent model-scoped one
+    ///   is understated: the account could do plenty of non-Fable work the
+    ///   Fable window can't constrain. That direction is deliberate — this leg
+    ///   stays quiet rather than promising capacity that a cap forbids.
     private static func attachWeeklyAtRisk(
         to candidates: inout [CandidateTrace], windows: [String: [LimitStatus]],
         aggregatePace: Double, effectiveMultipliers: [String: Double], now: Date
@@ -610,10 +616,24 @@ enum BestAccount {
             let accountID = candidates[index].accountID
             let multiplier = effectiveMultipliers[accountID] ?? 1
             let coverage = totalAbsorbable - (absorbable[index] ?? 0)
+            // Every window is evaluated on the account's *binding* headroom,
+            // not its own: model-scoped usage also lands in the overall weekly
+            // window, so the tightest window caps what prioritizing this
+            // account can actually save — the same argument that makes
+            // `absorbable` a minimum, applied in the same direction. Without
+            // the cap an account with a spare model window behind a nearly
+            // spent overall weekly window (Fable 20%, Weekly 90%) reported
+            // Fable's whole headroom as savable and could win the leg on
+            // capacity the weekly cap forbids it to spend.
+            //
+            // Windows are still scanned one by one, because only the reset
+            // clock varies between them and capacity behind an earlier reset
+            // expires sooner — which is exactly what this leg looks for.
+            let binding = absorbable[index] ?? 0
             var best: (units: Double, window: LimitStatus)?
             for window in windows[accountID] ?? [] {
                 let units = atRiskCapacity(
-                    headroom: headroomUnits(window, multiplier: multiplier),
+                    headroom: binding,
                     resetsAt: window.resetsAt,
                     aggregatePace: aggregatePace,
                     coverage: coverage,
@@ -859,23 +879,39 @@ enum BestAccount {
         return Badge(projectedExhaustion: nil)
     }
 
-    /// The 5-hour session window among an account's limits. Both providers
-    /// label their short window "Session" (Claude from kind `session`, Codex
-    /// from a primary window of ≤ 24h), so match by name and fall back to
-    /// the front of the list — both builders sort the session slot first.
-    /// Everything else (weekly, per-model 7-day, Codex secondary/extra
-    /// windows) is week-scoped, which is what the veto above relies on.
+    /// The short "session" window among an account's limits. The stated
+    /// duration decides when there is one — Codex sends
+    /// `limit_window_seconds`, Claude's kinds name their windows — and both
+    /// builders sort the session slot first, so the first sub-day window is
+    /// it. Limits that state no duration fall back to the name match ("Session"
+    /// from both providers) and then to the front of the list.
     static func sessionLimit(in limits: [LimitStatus]) -> LimitStatus? {
-        limits.first { $0.name == "Session" } ?? limits.first
+        let stated = limits.first {
+            guard let seconds = $0.windowSeconds else { return false }
+            return seconds < LimitStatus.multiDayThreshold
+        }
+        return stated ?? limits.first { $0.name == "Session" } ?? limits.first
     }
 
-    /// Everything that isn't the session window: the overall weekly window,
-    /// model-scoped 7-day windows (Fable, Opus…), Codex's secondary window.
-    /// These are what the weekly leg (issue #21) and the exhaustion veto
-    /// operate on. Empty when there are no limits at all — an account with a
-    /// single window has that window as its session slot.
+    /// The week-scoped windows: the overall weekly window, model-scoped 7-day
+    /// windows (Fable, Opus…), Codex's secondary window. These are what the
+    /// weekly leg (issue #21) and the exhaustion veto operate on.
+    ///
+    /// Length decides, not "everything that isn't the session slot". Codex
+    /// labels an account's additional per-model limits "<name> 5h" and
+    /// "<name> 7d" (`CodexProvider.buildLimits`), so the exclusion rule let a
+    /// five-hour window into the weekly leg — where a %/hour pace is ~34× the
+    /// same usage measured on a seven-day window, enough for one such window
+    /// to swamp the pooled weekly demand, and where its hours-away reset got
+    /// reported as a week's worth of capacity expiring. A limit that states no
+    /// duration keeps the old exclusion behavior, since nothing better is
+    /// known about it.
     static func weeklyWindows(in limits: [LimitStatus]) -> [LimitStatus] {
-        guard let session = sessionLimit(in: limits) else { return [] }
-        return limits.filter { $0.id != session.id }
+        let session = sessionLimit(in: limits)
+        return limits.filter { limit in
+            guard limit.id != session?.id else { return false }
+            guard let seconds = limit.windowSeconds else { return true }
+            return seconds >= LimitStatus.multiDayThreshold
+        }
     }
 }

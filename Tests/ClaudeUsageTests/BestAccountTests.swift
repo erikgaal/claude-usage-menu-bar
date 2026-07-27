@@ -79,6 +79,12 @@ final class BestAccountTests: XCTestCase {
         var name: String = "Weekly"
         var percent: Double
         var resetIn: TimeInterval?
+        /// What the provider said the window's length is. Nil — the default,
+        /// so the older fixtures keep exercising the no-duration fallback —
+        /// means "unstated", which the classifier treats as week-scoped.
+        /// Set it to a sub-day value to build a short window that is *not*
+        /// the session slot, the shape Codex's per-model extra limits have.
+        var windowSeconds: TimeInterval?
     }
 
     /// Claude-shaped state with an explicit set of weekly-scoped windows, for
@@ -86,20 +92,22 @@ final class BestAccountTests: XCTestCase {
     /// seconds after the fixed `now`.
     private func makeState(
         session: Double, sessionResetIn: TimeInterval? = 4 * 3600,
+        sessionWindowSeconds: TimeInterval? = nil,
         weekly: [Weekly], needsReauth: Bool = false
     ) -> AccountDisplayState {
         var limits = [
             LimitStatus(
                 id: "session|", name: "Session", percent: session,
                 resetsAt: sessionResetIn.map { Self.now.addingTimeInterval($0) },
-                isActive: false, sortOrder: 0)
+                isActive: false, sortOrder: 0, windowSeconds: sessionWindowSeconds)
         ]
         for (index, window) in weekly.enumerated() {
             limits.append(
                 LimitStatus(
                     id: "\(window.name)|", name: window.name, percent: window.percent,
                     resetsAt: window.resetIn.map { Self.now.addingTimeInterval($0) },
-                    isActive: false, sortOrder: index + 1))
+                    isActive: false, sortOrder: index + 1,
+                    windowSeconds: window.windowSeconds))
         }
         return makeState(limits: limits, needsReauth: needsReauth)
     }
@@ -1677,6 +1685,144 @@ final class BestAccountTests: XCTestCase {
         XCTAssertEqual(Set(result.keys), ["a"])
         XCTAssertEqual(result["a"]?.expiring?.scopeName, "Fable")
         XCTAssertEqual(try XCTUnwrap(result["a"]?.expiring?.points), 40, accuracy: 1e-9)
+    }
+
+    // MARK: Which windows the weekly leg speaks for
+
+    /// A Codex account's per-model extra limits arrive as "<name> 5h" and
+    /// "<name> 7d" (`CodexProvider.buildLimits`). The five-hour one is neither
+    /// the session slot nor week-scoped, so it must stay out of this leg
+    /// entirely: a %/hour pace on a five-hour window is ~34× the same usage
+    /// measured over a week, so letting it in swamps the pooled weekly demand.
+    func testShortExtraWindowStaysOutOfTheWeeklyLeg() throws {
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (
+                makeAccount("a"),
+                makeState(
+                    session: 40, sessionWindowSeconds: 5 * 3600,
+                    weekly: [
+                        Weekly(percent: 50, resetIn: 72 * 3600, windowSeconds: 7 * 86400),
+                        Weekly(
+                            name: "Gpt 5 Pro 5h", percent: 30, resetIn: 4 * 3600,
+                            windowSeconds: 5 * 3600),
+                    ])
+            ),
+            (
+                makeAccount("b"),
+                makeState(
+                    session: 10, sessionWindowSeconds: 5 * 3600,
+                    weekly: [Weekly(percent: 20, resetIn: 200 * 3600, windowSeconds: 7 * 86400)])
+            ),
+        ]
+        // Only the seven-day window is week-scoped; the five-hour extra window
+        // and the session slot are both excluded.
+        let limits = try XCTUnwrap(pairs.first?.1?.limits)
+        XCTAssertEqual(BestAccount.weeklyWindows(in: limits).map(\.name), ["Weekly"])
+        XCTAssertEqual(BestAccount.sessionLimit(in: limits)?.id, "session|")
+
+        let weekly = [
+            "a": rates(byWindow: ["Weekly": 0.5, "Gpt 5 Pro 5h": 12]),
+            "b": rates(byWindow: ["Weekly": 0.5]),
+        ]
+        let trace = try XCTUnwrap(traces(pairs, weeklyRates: weekly).first)
+        // The pool is 0.5 + 0.5 %/h, not 12 + 0.5: the fast short window is
+        // not part of the week's demand.
+        XCTAssertEqual(trace.weeklyAggregatePace, 0.01, accuracy: 1e-12)
+        XCTAssertEqual(candidate("a", in: trace)?.weeklyBurnRate, 0.5)
+        XCTAssertEqual(candidate("a", in: trace)?.weeklyName, "Weekly")
+        XCTAssertEqual(
+            candidate("a", in: trace)?.weeklyResetsAt, Self.now.addingTimeInterval(72 * 3600))
+    }
+
+    /// The exhaustion veto exists because a spent *week* makes session
+    /// headroom a mirage. A spent five-hour sub-limit doesn't, so it must not
+    /// veto the account — while a spent seven-day window still does.
+    func testExhaustedShortExtraWindowDoesNotVeto() throws {
+        func state(shortPercent: Double, weeklyPercent: Double) -> AccountDisplayState {
+            makeState(
+                session: 20, sessionWindowSeconds: 5 * 3600,
+                weekly: [
+                    Weekly(percent: weeklyPercent, resetIn: 72 * 3600, windowSeconds: 7 * 86400),
+                    Weekly(
+                        name: "Gpt 5 Pro 5h", percent: shortPercent, resetIn: 4 * 3600,
+                        windowSeconds: 5 * 3600),
+                ])
+        }
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (makeAccount("short-spent"), state(shortPercent: 99.9, weeklyPercent: 40)),
+            (makeAccount("week-spent"), state(shortPercent: 10, weeklyPercent: 99.9)),
+        ]
+        let trace = try XCTUnwrap(traces(pairs).first)
+        XCTAssertEqual(candidate("short-spent", in: trace)?.eligibility, .eligible)
+        XCTAssertEqual(
+            candidate("week-spent", in: trace)?.eligibility,
+            .vetoedWeeklyExhausted(limitName: "Weekly", percent: 99.9))
+    }
+
+    /// The stated duration outranks the name and the list order, so a short
+    /// window that neither is called "Session" nor comes first is still found.
+    func testSessionLimitPrefersAStatedDurationOverTheName() {
+        let stated = [
+            LimitStatus(
+                id: "weekly_all|", name: "Weekly", percent: 10, resetsAt: nil,
+                isActive: false, sortOrder: 0, windowSeconds: 7 * 86400),
+            LimitStatus(
+                id: "primary|", name: "Primary", percent: 20, resetsAt: nil,
+                isActive: false, sortOrder: 1, windowSeconds: 5 * 3600),
+        ]
+        XCTAssertEqual(BestAccount.sessionLimit(in: stated)?.id, "primary|")
+        XCTAssertEqual(BestAccount.weeklyWindows(in: stated).map(\.name), ["Weekly"])
+
+        // With no sub-day window stated anywhere, the name match still rules.
+        let unstated = [
+            makeLimit(id: "weekly_all|", name: "Weekly", percent: 10, sortOrder: 0),
+            makeLimit(id: "session|", name: "Session", percent: 20, sortOrder: 1),
+        ]
+        XCTAssertEqual(BestAccount.sessionLimit(in: unstated)?.id, "session|")
+    }
+
+    /// An account's weekly capacity is bounded by its tightest window, because
+    /// model-scoped usage also lands in the overall weekly window. A spare
+    /// Fable window behind a nearly spent overall week is therefore not
+    /// savable capacity — scoring it as such would badge the account on
+    /// capacity the weekly cap forbids it to spend.
+    func testWeeklyAtRiskIsBoundedByTheTightestWindow() throws {
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (
+                makeAccount("a"),
+                makeState(
+                    session: 40,
+                    weekly: [
+                        Weekly(percent: 90, resetIn: 72 * 3600),
+                        Weekly(name: "Fable", percent: 20, resetIn: 72 * 3600),
+                    ])
+            ),
+            (
+                makeAccount("b"),
+                makeState(session: 10, weekly: [Weekly(percent: 10, resetIn: 200 * 3600)])
+            ),
+        ]
+        let weekly = [
+            "a": rates(byWindow: ["Weekly": 0.5]),
+            "b": rates(byWindow: ["Weekly": 0.5]),
+        ]
+        let trace = try XCTUnwrap(traces(pairs, weeklyRates: weekly).first)
+        // Bounded by the overall weekly window's 10 points, not Fable's 80.
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("a", in: trace)?.weeklyAtRiskUnits), 0.1, accuracy: 1e-9)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("a", in: trace)?.weeklyAtRiskPercent), 10, accuracy: 1e-9)
+        XCTAssertEqual(candidate("a", in: trace)?.weeklyName, "Weekly")
+
+        // 0.1 units is under `weeklyAtRiskFloor`, so the leg stands down and
+        // the v2 headroom ranking decides — where b's session headroom wins.
+        // Scoring Fable's 0.72 units instead would have cleared the floor and
+        // badged a with "≈72% of Fable expires at reset".
+        guard case .belowFloor(let top) = try XCTUnwrap(trace.weeklyCapacityFallback) else {
+            return XCTFail("expected the weekly leg to stand down below its floor")
+        }
+        XCTAssertEqual(top, 0.1, accuracy: 1e-9)
+        XCTAssertEqual(winners(pairs, weeklyRates: weekly), ["b"])
     }
 
     func testWeeklyLegNeverBadgesVetoedAccounts() throws {
