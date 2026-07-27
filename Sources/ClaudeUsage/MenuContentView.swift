@@ -171,16 +171,35 @@ private struct NotificationsToggleRow: View {
     @ObservedObject var notifier: UsageNotifier
 
     var body: some View {
-        HStack {
-            Text("Enable notifications")
-            Spacer()
-            Toggle("", isOn: $notifier.isEnabled)
-                .labelsHidden()
-                .toggleStyle(.checkbox)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Enable notifications")
+                Spacer()
+                Toggle("", isOn: $notifier.isEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.checkbox)
+            }
+            .help(
+                "Alerts when a limit passes \(Int(UsageNotifier.thresholdPercent))%, "
+                    + "when it resets, and when sign-in expires")
+
+            // Advisory half of the feature (issue #24), indented under its
+            // master switch and inert while that switch is off — limit alerts
+            // are urgent, switch advice is not.
+            HStack {
+                Text("Suggest account switches")
+                Spacer()
+                Toggle("", isOn: $notifier.suggestsSwitches)
+                    .labelsHidden()
+                    .toggleStyle(.checkbox)
+            }
+            .padding(.leading, 14)
+            .foregroundStyle(notifier.isEnabled ? .primary : .tertiary)
+            .disabled(!notifier.isEnabled)
+            .help(
+                "Tells you when another account of the same provider is the "
+                    + "better one to be using right now")
         }
-        .help(
-            "Alerts when a limit passes \(Int(UsageNotifier.thresholdPercent))%, "
-                + "when it resets, and when sign-in expires")
     }
 }
 
@@ -549,16 +568,11 @@ struct AccountSection: View {
         return "\(prefix) \(durationText(until: date))"
     }
 
+    /// Delegates to the one formatter in the app (`SwitchSuggestion` owns it,
+    /// since detection can't read the clock) so tooltips, the debug popover
+    /// and the switch notifications word a duration identically.
     static func durationText(until date: Date) -> String {
-        let seconds = date.timeIntervalSinceNow
-        guard seconds > 0 else { return "moments" }
-        let totalMinutes = Int(seconds / 60)
-        let days = totalMinutes / (60 * 24)
-        let hours = (totalMinutes / 60) % 24
-        let minutes = totalMinutes % 60
-        if days > 0 { return "\(days)d \(hours)h" }
-        if hours > 0 { return "\(hours)h \(minutes)m" }
-        return "\(minutes)m"
+        SwitchSuggestion.durationText(seconds: date.timeIntervalSinceNow)
     }
 }
 

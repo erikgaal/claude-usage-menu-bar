@@ -388,6 +388,7 @@ final class AccountStore: ObservableObject {
                     group.addTask { await self.refresh(account: account, force: false) }
                 }
             }
+            notifySwitchSuggestions()
         }
     }
 
@@ -401,12 +402,28 @@ final class AccountStore: ObservableObject {
         }
     }
 
-    private func refreshAll(force: Bool) async {
+    /// Refreshes every account concurrently, then evaluates the group-level
+    /// notifications once. Internal rather than private so tests can await a
+    /// whole cycle instead of racing the fire-and-forget `refreshNow`.
+    func refreshAll(force: Bool) async {
         await withTaskGroup(of: Void.self) { group in
             for account in accounts {
                 group.addTask { await self.refresh(account: account, force: force) }
             }
         }
+        notifySwitchSuggestions()
+    }
+
+    /// Hands the notifier the cross-account picture after a *completed*
+    /// refresh cycle — the same badges and burn rates the panel would show —
+    /// so "a better account is available" is judged on one consistent
+    /// snapshot rather than per account mid-cycle (issue #24). The decision
+    /// itself is pure (`SwitchSuggestion`); the store's whole contribution is
+    /// gathering the inputs, exactly as `bestBadges` does for the badge.
+    private func notifySwitchSuggestions() {
+        notifier.groupsDidUpdate(
+            accounts: accounts, badges: bestBadges,
+            sessionBurnRates: sessionBurnRates, now: Date())
     }
 
     func refresh(account: AccountMeta, force: Bool) async {

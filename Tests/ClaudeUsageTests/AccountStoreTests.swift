@@ -1021,6 +1021,58 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(harness.scheduler.posted.first?.body, "Limit 0 limit at 92%")
     }
 
+    /// The pace-aware fixture from `testBestBadgesArePaceAwareEndToEnd`, with
+    /// labels: "Work" burns 30%/h at 40% used, "Personal" burns 3%/h at 55%,
+    /// so the badge lands on Personal while Work is the account in use.
+    private func makeSwitchHarness(notificationsEnabled: Bool = true) -> (
+        Harness, AccountMeta, AccountMeta
+    ) {
+        let work = makeAccount(id: "acct-1", label: "Work")
+        let personal = makeAccount(id: "acct-2", email: "other@example.com", label: "Personal")
+        let provider = ProviderFake()
+        provider.setFetchResult(
+            .success(makeSessionSnapshot(percent: 40)), forAccount: work.id)
+        provider.setFetchResult(
+            .success(makeSessionSnapshot(percent: 55)), forAccount: personal.id)
+        let harness = makeHarness(
+            provider: provider, accounts: [work, personal],
+            vault: [work.id: makeTokens(), personal.id: makeTokens()],
+            notificationsEnabled: notificationsEnabled)
+        seedSessionRamp(
+            directory: harness.historyDirectory, account: work.id,
+            endPercent: 40, ratePerHour: 30)
+        seedSessionRamp(
+            directory: harness.historyDirectory, account: personal.id,
+            endPercent: 55, ratePerHour: 3)
+        return (harness, work, personal)
+    }
+
+    func testCompletedRefreshCycleSuggestsSwitchingOnce() async {
+        let (harness, _, _) = makeSwitchHarness()
+
+        await harness.store.refreshAll(force: true)
+
+        // Exactly one banner for the whole cycle — the decision is
+        // group-level, not per account.
+        XCTAssertEqual(harness.scheduler.posted.count, 1)
+        XCTAssertEqual(harness.scheduler.posted.first?.title, "Switch to Personal")
+        XCTAssertEqual(
+            harness.scheduler.posted.first?.body.hasSuffix("of session left at current pace"),
+            true)
+
+        // The next cycle finds the same situation: the edge trigger holds.
+        await harness.store.refreshAll(force: true)
+        XCTAssertEqual(harness.scheduler.posted.count, 1)
+    }
+
+    func testRefreshCycleSuggestsNothingWhileNotificationsAreOff() async {
+        let (harness, _, _) = makeSwitchHarness(notificationsEnabled: false)
+
+        await harness.store.refreshAll(force: true)
+
+        XCTAssertTrue(harness.scheduler.posted.isEmpty)
+    }
+
     func testRefreshNotifiesOnSignInExpiry() async {
         let account = makeAccount()
         let harness = makeHarness(

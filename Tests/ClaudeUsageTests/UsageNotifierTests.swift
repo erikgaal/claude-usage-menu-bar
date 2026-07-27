@@ -329,6 +329,111 @@ final class UsageNotifierTests: XCTestCase {
         XCTAssertTrue(spy.pending.isEmpty)
     }
 
+    // MARK: Switch suggestions
+
+    /// Two Claude accounts, "Work" burning and "Personal" badged — the shape
+    /// `groupsDidUpdate` is meant to act on.
+    private func switchFixture() -> (
+        accounts: [AccountMeta], badges: [String: BestAccount.Badge]
+    ) {
+        let work = makeAccount(id: "acct-a", label: "Work")
+        let personal = makeAccount(id: "acct-b", label: "Personal")
+        return ([work, personal], [personal.id: BestAccount.Badge()])
+    }
+
+    func testGroupUpdatePostsSwitchSuggestionWithTargetInTheIdentifier() throws {
+        let (notifier, spy) = makeNotifier()
+        let (accounts, badges) = switchFixture()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        notifier.groupsDidUpdate(
+            accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24], now: now)
+
+        XCTAssertEqual(spy.posted.count, 1)
+        let request = try XCTUnwrap(spy.posted.first)
+        XCTAssertEqual(request.title, "Switch to Personal")
+        XCTAssertEqual(request.body, "more session headroom right now")
+        // Delivered immediately, and the target account id is recoverable from
+        // the identifier for a future action button (PR #16).
+        XCTAssertNil(request.fireDate)
+        XCTAssertEqual(request.identifier, "switch|claude|acct-b|1700000000")
+    }
+
+    func testGroupUpdateDoesNotRepostAnUnchangedRecommendation() {
+        let (notifier, spy) = makeNotifier()
+        let (accounts, badges) = switchFixture()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        notifier.groupsDidUpdate(
+            accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24], now: now)
+        // An hour later, same situation: the notifier keeps the pure
+        // function's state across cycles, so the edge trigger holds.
+        notifier.groupsDidUpdate(
+            accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24],
+            now: now.addingTimeInterval(3600))
+        XCTAssertEqual(spy.posted.count, 1)
+    }
+
+    func testSwitchSuggestionsRequireTheMasterToggle() {
+        let (notifier, spy) = makeNotifier(enabled: false)
+        let (accounts, badges) = switchFixture()
+        XCTAssertTrue(notifier.suggestsSwitches)
+
+        notifier.groupsDidUpdate(
+            accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24])
+        XCTAssertTrue(spy.posted.isEmpty)
+    }
+
+    func testSwitchSuggestionsToggleSilencesThemImmediately() {
+        let (notifier, spy) = makeNotifier()
+        let (accounts, badges) = switchFixture()
+        notifier.suggestsSwitches = false
+
+        notifier.groupsDidUpdate(
+            accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24])
+        XCTAssertTrue(spy.posted.isEmpty)
+
+        // Threshold and reauth alerts are unaffected: only the advisory half
+        // is off.
+        notifier.accountDidUpdate(
+            makeAccount(),
+            old: makeState([makeLimit(percent: 80)]),
+            new: makeState([makeLimit(percent: 95)]))
+        XCTAssertEqual(spy.posted.count, 1)
+    }
+
+    func testTogglingSuggestionsBackOnForgetsThePreviousAdvice() {
+        let (notifier, spy) = makeNotifier()
+        let (accounts, badges) = switchFixture()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        notifier.groupsDidUpdate(
+            accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24], now: now)
+        XCTAssertEqual(spy.posted.count, 1)
+
+        // Off and on again: the memory is cleared, so the current
+        // recommendation is delivered rather than swallowed by a stale edge.
+        notifier.suggestsSwitches = false
+        notifier.suggestsSwitches = true
+        notifier.groupsDidUpdate(
+            accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24],
+            now: now.addingTimeInterval(60))
+        XCTAssertEqual(spy.posted.count, 2)
+    }
+
+    func testSuggestionsSettingDefaultsOnAndPersistsIndependently() {
+        let defaults = makeDefaults()
+        let first = UsageNotifier(scheduler: SchedulerSpy(), defaults: defaults)
+        XCTAssertTrue(first.suggestsSwitches)
+        first.suggestsSwitches = false
+
+        // Relaunch: the opt-out survives, and it is its own key — the master
+        // toggle is untouched.
+        let second = UsageNotifier(scheduler: SchedulerSpy(), defaults: defaults)
+        XCTAssertFalse(second.suggestsSwitches)
+        XCTAssertFalse(second.isEnabled)
+    }
+
     func testEnabledStatePersistsWithoutReprompting() {
         let defaults = makeDefaults()
         let firstSpy = SchedulerSpy()

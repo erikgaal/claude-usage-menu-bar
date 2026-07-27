@@ -95,9 +95,15 @@ final class UsageNotifier: ObservableObject {
     static let thresholdPercent: Double = 90
 
     private static let defaultsKey = "notificationsEnabled"
+    private static let switchSuggestionsKey = "switchSuggestionsEnabled"
 
     private let scheduler: NotificationScheduling
     private let defaults: UserDefaults
+
+    /// Per-provider notification memory behind the switch suggestions
+    /// (issue #24). In memory only — see `SwitchSuggestion.GroupState` for the
+    /// reasoning and the relaunch consequence.
+    private var switchState: [ProviderID: SwitchSuggestion.GroupState] = [:]
 
     /// User toggle from the panel footer. Enabling requests system
     /// authorization (the OS only prompts the first time); disabling drops
@@ -106,11 +112,32 @@ final class UsageNotifier: ObservableObject {
         didSet {
             guard oldValue != isEnabled else { return }
             defaults.set(isEnabled, forKey: Self.defaultsKey)
+            // Either direction forgets what we suggested: the advice is only
+            // meaningful next to the situation it described, and a user who
+            // just turned notifications back on should hear the current
+            // recommendation rather than be silenced by a stale edge.
+            switchState.removeAll()
             if isEnabled {
                 scheduler.requestAuthorization()
             } else {
                 scheduler.removeAllPending()
             }
+        }
+    }
+
+    /// The advisory half of the feature: "Suggest account switches" in the
+    /// panel footer, gated by `isEnabled` (limit alerts are urgent, switch
+    /// advice is not, and the issue expects one without the other to be
+    /// possible). Defaults to on, so enabling notifications delivers the whole
+    /// feature; opting out is one click and is remembered under its own key.
+    /// Toggling clears the notification memory, so switching it off stops
+    /// suggestions on the very next cycle and switching it on doesn't inherit
+    /// a stale edge.
+    @Published var suggestsSwitches: Bool {
+        didSet {
+            guard oldValue != suggestsSwitches else { return }
+            defaults.set(suggestsSwitches, forKey: Self.switchSuggestionsKey)
+            switchState.removeAll()
         }
     }
 
@@ -129,6 +156,11 @@ final class UsageNotifier: ObservableObject {
         // Assigning in init doesn't trip didSet, so restoring the saved value
         // never re-prompts for authorization at launch.
         isEnabled = defaults.bool(forKey: Self.defaultsKey)
+        // Absent key → on: `bool(forKey:)` alone would default the advisory
+        // alerts off and leave the feature invisible to anyone who never opens
+        // the footer.
+        suggestsSwitches =
+            defaults.object(forKey: Self.switchSuggestionsKey) as? Bool ?? true
     }
 
     // MARK: - Event detection
@@ -167,6 +199,49 @@ final class UsageNotifier: ObservableObject {
         }
 
         rescheduleResetAlerts(for: account, limits: new.limits)
+    }
+
+    // MARK: - Switch suggestions
+
+    /// Called by `AccountStore` once per *completed* refresh cycle with the
+    /// cross-account picture the panel would show: every account, the badges
+    /// the ranking awarded, and each account's session burn rate. Unlike
+    /// `accountDidUpdate` this is deliberately group-level — "you're burning
+    /// the wrong account" is a comparison, so evaluating it per account would
+    /// judge half-refreshed data and could post twice for one cycle.
+    ///
+    /// The decision itself is `SwitchSuggestion.evaluate` (pure); this method
+    /// owns only the toggles, the notification memory, and the posting.
+    func groupsDidUpdate(
+        accounts: [AccountMeta],
+        badges: [String: BestAccount.Badge],
+        sessionBurnRates: [String: Double],
+        now: Date = Date()
+    ) {
+        guard isEnabled, suggestsSwitches else { return }
+        let outcome = SwitchSuggestion.evaluate(
+            accounts: accounts, badges: badges, sessionBurnRates: sessionBurnRates,
+            state: switchState, now: now)
+        switchState = outcome.state
+        for suggestion in outcome.suggestions {
+            scheduler.add(
+                identifier: Self.switchIdentifier(for: suggestion, now: now),
+                title: suggestion.title, body: suggestion.body, fireDate: nil)
+        }
+    }
+
+    /// "switch|<provider>|<toAccountID>|<unixSeconds>" — the target account is
+    /// encoded in the identifier so PR #16's account switching can later hang
+    /// an action button off this notification and know which account to switch
+    /// to, without the `NotificationScheduling` seam having to carry a
+    /// `userInfo` payload today. The timestamp keeps successive suggestions
+    /// distinct (identifiers are the center's replace key) while leaving the
+    /// prefix stable and parseable.
+    private static func switchIdentifier(
+        for suggestion: SwitchSuggestion.Suggestion, now: Date
+    ) -> String {
+        "switch|\(suggestion.provider.rawValue)|\(suggestion.toAccountID)|"
+            + "\(Int(now.timeIntervalSince1970))"
     }
 
     // MARK: - Reset scheduling
