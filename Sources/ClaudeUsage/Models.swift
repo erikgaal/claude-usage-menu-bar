@@ -77,6 +77,11 @@ struct StoredTokens: Codable {
 
 /// One rate-limit window as displayed in the UI.
 struct LimitStatus: Identifiable, Equatable {
+    /// Windows at or beyond this length get a trend chart: a multi-day
+    /// window is the only kind where recorded history spans enough of it for
+    /// a trend line and an end-of-window projection to say anything.
+    static let multiDayThreshold: TimeInterval = 24 * 3600
+
     let id: String
     let name: String
     /// 0–100
@@ -84,6 +89,35 @@ struct LimitStatus: Identifiable, Equatable {
     let resetsAt: Date?
     let isActive: Bool
     let sortOrder: Int
+    /// How long this window is, when the provider states it (Codex) or its
+    /// kind names it (Claude's five-hour and seven-day windows). Nil when
+    /// unrecognized — never guessed, since `resetsAt - windowSeconds` is
+    /// what dates the start of the current window.
+    let windowSeconds: TimeInterval?
+
+    init(
+        id: String, name: String, percent: Double, resetsAt: Date?, isActive: Bool,
+        sortOrder: Int, windowSeconds: TimeInterval? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.percent = percent
+        self.resetsAt = resetsAt
+        self.isActive = isActive
+        self.sortOrder = sortOrder
+        self.windowSeconds = windowSeconds
+    }
+
+    /// Start of the window this percent belongs to — the anchor for the
+    /// trend chart's x-axis and its even-pace reference.
+    var windowStart: Date? {
+        guard let resetsAt, let windowSeconds else { return nil }
+        return resetsAt.addingTimeInterval(-windowSeconds)
+    }
+
+    /// Whether this is a multi-day window (weekly and friends), i.e. one
+    /// worth charting. Unknown lengths answer false rather than guessing.
+    var isMultiDay: Bool { (windowSeconds ?? 0) >= Self.multiDayThreshold }
 }
 
 /// Extra-usage ("credits") spend for an account, rendered as its own bar.

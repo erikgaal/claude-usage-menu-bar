@@ -186,17 +186,20 @@ enum UsageAPI {
                         percent: percent,
                         resetsAt: ISO8601.parse(limit.resetsAt),
                         isActive: limit.isActive ?? false,
-                        sortOrder: sortOrder
+                        sortOrder: sortOrder,
+                        windowSeconds: windowSeconds(forKind: limit.kind)
                     ))
             }
         } else {
-            let windows: [(String, UsageResponse.Window?, Int)] = [
-                ("Session", response.fiveHour, 0),
-                ("Weekly", response.sevenDay, 1),
-                ("Opus", response.sevenDayOpus, 2),
-                ("Sonnet", response.sevenDaySonnet, 3),
+            // The window length is in each field's own name (`five_hour`,
+            // `seven_day…`), so it's stated data here, not an inference.
+            let windows: [(String, UsageResponse.Window?, Int, TimeInterval)] = [
+                ("Session", response.fiveHour, 0, 5 * 3600),
+                ("Weekly", response.sevenDay, 1, 7 * 86400),
+                ("Opus", response.sevenDayOpus, 2, 7 * 86400),
+                ("Sonnet", response.sevenDaySonnet, 3, 7 * 86400),
             ]
-            for (name, window, sortOrder) in windows {
+            for (name, window, sortOrder, windowSeconds) in windows {
                 guard let window, let utilization = window.utilization else { continue }
                 result.append(
                     LimitStatus(
@@ -205,7 +208,8 @@ enum UsageAPI {
                         percent: utilization,
                         resetsAt: ISO8601.parse(window.resetsAt),
                         isActive: false,
-                        sortOrder: sortOrder
+                        sortOrder: sortOrder,
+                        windowSeconds: windowSeconds
                     ))
             }
         }
@@ -213,5 +217,18 @@ enum UsageAPI {
         return result.sorted {
             ($0.sortOrder, $0.name) < ($1.sortOrder, $1.name)
         }
+    }
+
+    /// Window length for a `limits[].kind`. The usage endpoint never states a
+    /// duration, but the kind vocabulary names one: `session` is the
+    /// five-hour window, and every `weekly_*` kind (all-models and the
+    /// model-scoped ones like Fable) is the seven-day window. Anything
+    /// unrecognized maps to nil rather than a guess — a wrong length would
+    /// silently mis-date the start of the window on the trend chart.
+    static func windowSeconds(forKind kind: String?) -> TimeInterval? {
+        guard let kind = kind?.lowercased() else { return nil }
+        if kind.contains("session") { return 5 * 3600 }
+        if kind.contains("weekly") { return 7 * 86400 }
+        return nil
     }
 }

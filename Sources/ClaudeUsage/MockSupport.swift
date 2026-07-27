@@ -34,7 +34,10 @@ enum Mock {
                 LimitStatus(
                     id: row.0, name: row.0, percent: row.1,
                     resetsAt: now.addingTimeInterval(row.2),
-                    isActive: index == 0, sortOrder: index)
+                    isActive: index == 0, sortOrder: index,
+                    // Session rows reset within a day; everything else is a
+                    // seven-day window, matching both providers' real shapes.
+                    windowSeconds: row.2 < 24 * 3600 ? 5 * 3600 : 7 * 86400)
             }
         }
         func state(
@@ -64,11 +67,68 @@ enum Mock {
                 credits: CreditsStatus(
                     usedMinor: 320, limitMinor: nil, currency: "GBP", exponent: 2,
                     percent: 0, enabled: true)),
+            // The Codex weekly window is deliberately mid-flight (reset in
+            // 2d 8h ⇒ started 4¾ days ago): its expanded trend chart is the
+            // one in the README, and a window that only just began would
+            // show a sliver of recorded history against six blank days.
             "mock-codex": state([
                 ("Session", 18, 2 * 3600 + 5 * 60),
-                ("Weekly", 63, 6 * 86400 + 2 * 3600),
+                ("Weekly", 71, 2 * 86400 + 8 * 3600),
             ]),
         ]
+    }
+
+    /// One expanded trend chart for the screenshots — the Codex account, whose
+    /// single seven-day window makes for exactly one chart. The Claude
+    /// accounts stay collapsed, so the shot also shows the closed affordance.
+    static let expandedTrends: Set<String> = ["mock-codex|Weekly"]
+
+    // MARK: - Fake trend
+
+    /// A plausible recorded-and-projected series for the trend chart. Mock
+    /// mode never writes history (see `UsageHistoryStore.record`), so the
+    /// screenshots would otherwise show an empty chart.
+    ///
+    /// Shape: recording starts a few hours into the window, climbs in daily
+    /// bursts separated by flat overnight stretches, and lands exactly on the
+    /// limit's current percent — then projects from the most recent burst's
+    /// pace, the same way the real fit does.
+    static func trend(for limit: LimitStatus, windowStart: Date, windowEnd: Date)
+        -> UsageTrend?
+    {
+        let now = Date()
+        let start = windowStart.addingTimeInterval(5 * 3600)
+        guard now > start.addingTimeInterval(3600) else { return nil }
+
+        let span = now.timeIntervalSince(start)
+        let steps = 96
+        // Fraction of the total climb completed by each step: flat at night
+        // (a cosine trough), steeper by day, normalized to end at 1.
+        var shape: [Double] = []
+        var total = 0.0
+        for step in 0..<steps {
+            let phase = Double(step) / Double(steps) * span / 86400 * 2 * .pi
+            total += max(0.05, 0.5 + 0.5 * cos(phase))
+            shape.append(total)
+        }
+        let recorded = shape.enumerated().map { index, cumulative in
+            UsageTrend.Point(
+                date: start.addingTimeInterval(span * Double(index) / Double(steps - 1)),
+                percent: limit.percent * cumulative / total)
+        }
+
+        guard let latest = recorded.last else { return nil }
+        // Recent pace: the last eighth of the series, which is where a real
+        // 12-hour fit would be looking.
+        let earlier = recorded[recorded.count - steps / 8]
+        let hours = latest.date.timeIntervalSince(earlier.date) / 3600
+        let rate = hours > 0 ? max(0, (latest.percent - earlier.percent) / hours) : 0
+        let projection = UsageTrend.project(
+            from: latest, ratePerHour: rate, windowEnd: windowEnd)
+        return UsageTrend(
+            windowStart: windowStart, windowEnd: windowEnd, recorded: recorded,
+            projected: projection.points, ratePerHour: rate,
+            projectedAtReset: projection.atReset, exhaustsAt: projection.exhaustsAt)
     }
 
     // MARK: - Screenshot sequence

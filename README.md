@@ -11,7 +11,7 @@ subscriptions — multiple accounts side by side:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-    <img alt="The Claude Usage panel showing three accounts (Claude Work, Claude Personal, and Codex) with per-limit usage bars, reset times, and extra-usage credit bars" src="docs/screenshot-light.png" width="436">
+    <img alt="The Claude Usage panel showing three accounts (Claude Work, Claude Personal, and Codex) with per-limit usage bars, reset times, extra-usage credit bars, and an expanded weekly trend chart on the Codex account" src="docs/screenshot-light.png" width="436">
   </picture>
 </p>
 
@@ -49,6 +49,23 @@ The menu bar shows one number per account: that account's most-used limit
 time. Claude accounts with extra usage enabled also get a **Credits** bar
 showing spend against your monthly cap (or just the amount spent, when no cap
 is set).
+
+Every multi-day window (the weekly limits) has a collapsible **burndown
+chart**: quota left on the y-axis, descending across the window. A solid line
+for what's been recorded, a dashed continuation at the current burn rate
+(flattening along the floor if it gets there before the reset — that stretch is
+time you'd spend locked out), and a hairline diagonal for the pace that would
+spend the window exactly, so below the line is overspending and above it is
+headroom. The caption states both framings, since the bars above count the
+other way: `71% used · 29% left · on pace to land at 6%`, or the time it runs
+out. Charts are collapsed by default and each one remembers whether you opened
+it.
+
+Every poll's per-limit percents are appended to a local history file (one JSON
+file per account under Application Support, 14 days of 5-minute samples), which
+is where both the trend charts and the burn-rate projections come from. Nothing
+leaves your machine; a fresh install has a line to draw within minutes and a
+projection once three polls span half an hour.
 
 ## Install (prebuilt app)
 

@@ -13,6 +13,68 @@ struct UsageSample: Codable, Equatable {
     let resetsAt: Date?
 }
 
+// MARK: - Trend
+
+/// One limit's shape over its current window: what was recorded, and where
+/// the current pace lands. Plain data with no formatting or drawing decisions,
+/// so the chart view has nothing to compute and the whole thing is testable
+/// without a view.
+///
+/// The projection reuses the same fitted burn rate as the pace caption and
+/// the best-account hint, so the chart can never disagree with the sentence
+/// printed next to it.
+struct UsageTrend: Equatable {
+    struct Point: Equatable, Identifiable {
+        let date: Date
+        let percent: Double
+
+        var id: Date { date }
+    }
+
+    /// Start of the current window (`resetsAt - windowSeconds`) — the x-axis
+    /// origin and the anchor of the even-pace reference.
+    let windowStart: Date
+    /// When the window resets: the x-axis end and the projection's horizon.
+    let windowEnd: Date
+    /// Recorded samples inside this window, oldest first, thinned for
+    /// drawing. Never empty — `trend(for:)` returns nil instead.
+    let recorded: [Point]
+    /// The projected path from the newest sample to `windowEnd`, empty when
+    /// there's no fittable pace. Flattens at 100% when the pace gets there
+    /// first, since usage can't exceed the cap.
+    let projected: [Point]
+    /// Fitted fill rate in percentage points per hour, nil when unfittable.
+    let ratePerHour: Double?
+    /// Where the current pace lands at reset, *uncapped* — above 100 means
+    /// the window runs out first, which is the interesting case.
+    let projectedAtReset: Double?
+    /// When the projection crosses 100%, if that happens before the reset.
+    let exhaustsAt: Date?
+
+    /// Newest recorded observation — the "you are here" point.
+    var latest: Point { recorded[recorded.count - 1] }
+
+    /// Straight-line extrapolation of one pace from the newest observation to
+    /// the window's end. The path flattens at 100% once the pace gets there,
+    /// because usage can't exceed the cap — the flat stretch is exactly the
+    /// runway that would be spent locked out.
+    static func project(
+        from latest: Point, ratePerHour: Double, windowEnd: Date
+    ) -> (points: [Point], atReset: Double, exhaustsAt: Date?) {
+        let hoursToReset = windowEnd.timeIntervalSince(latest.date) / 3600
+        let atReset = latest.percent + ratePerHour * hoursToReset
+        guard atReset > 100, ratePerHour > 0 else {
+            return ([latest, Point(date: windowEnd, percent: min(100, atReset))], atReset, nil)
+        }
+        let hoursLeft = (100 - latest.percent) / ratePerHour
+        let crossing = latest.date.addingTimeInterval(hoursLeft * 3600)
+        return (
+            [latest, Point(date: crossing, percent: 100), Point(date: windowEnd, percent: 100)],
+            atReset, crossing
+        )
+    }
+}
+
 // MARK: - Store
 
 /// Persists each successful poll's per-limit percents and answers burn-rate
@@ -122,6 +184,101 @@ final class UsageHistoryStore {
         return latest.timestamp.addingTimeInterval(hoursLeft * 3600)
     }
 
+    // MARK: - Trend series
+
+    /// Recorded-and-projected series for one limit's current window, or nil
+    /// when there's nothing to draw: the limit doesn't state its window, or
+    /// no samples have landed inside it yet.
+    ///
+    /// The window comes from the limit itself (`resetsAt - windowSeconds`)
+    /// rather than from history, so the x-axis is the real window even when
+    /// recording started partway through it — a line that begins on Thursday
+    /// tells the truth about what's known.
+    func trend(for limit: LimitStatus, accountID: String) -> UsageTrend? {
+        guard let windowStart = limit.windowStart, let windowEnd = limit.resetsAt else {
+            return nil
+        }
+        #if DEBUG
+            // Mock mode records nothing, so synthesize a plausible series for
+            // the README screenshots instead of an empty chart.
+            if Mock.isEnabled {
+                return Mock.trend(for: limit, windowStart: windowStart, windowEnd: windowEnd)
+            }
+        #endif
+
+        let samples = windowSamples(accountID: accountID, limitID: limit.id, since: windowStart)
+        let recorded = thin(samples, from: windowStart, to: windowEnd)
+        guard let latest = recorded.last else { return nil }
+
+        // A rate is only fitted from the current window's recent samples, so
+        // it agrees with the pace caption; clamp the noise floor at zero
+        // because a window's usage never falls except at its reset.
+        let rate = fit(accountID: accountID, limitID: limit.id).map { max(0, $0.ratePerHour) }
+        guard let rate, latest.date < windowEnd else {
+            return UsageTrend(
+                windowStart: windowStart, windowEnd: windowEnd, recorded: recorded,
+                projected: [], ratePerHour: rate, projectedAtReset: nil, exhaustsAt: nil)
+        }
+
+        let projection = UsageTrend.project(
+            from: latest, ratePerHour: rate, windowEnd: windowEnd)
+        return UsageTrend(
+            windowStart: windowStart, windowEnd: windowEnd, recorded: recorded,
+            projected: projection.points, ratePerHour: rate,
+            projectedAtReset: projection.atReset, exhaustsAt: projection.exhaustsAt)
+    }
+
+    /// Every sample for one limit inside the current window. Unlike
+    /// `currentWindowSamples` there's no lookback — the chart wants the whole
+    /// window — but the same reset-drop trim applies, so a window that reset
+    /// early (or a stale `resetsAt`) can't drag a previous window's tail in.
+    private func windowSamples(accountID: String, limitID: String, since: Date) -> [UsageSample] {
+        let window = samples(for: accountID).filter {
+            $0.limitID == limitID && $0.timestamp >= since
+        }
+        return trimAtLastReset(window)
+    }
+
+    /// Thins samples to at most `maxPoints` evenly spaced buckets, keeping
+    /// each bucket's newest sample (percent only climbs within a window, so
+    /// the newest is the bucket's peak) plus the first and last overall. A
+    /// week of 5-minute polls is ~2000 rows; drawing them all costs time and
+    /// shows nothing extra at 300 points wide.
+    private func thin(
+        _ samples: [UsageSample], from: Date, to: Date, maxPoints: Int = 120
+    ) -> [UsageTrend.Point] {
+        guard !samples.isEmpty else { return [] }
+        let span = to.timeIntervalSince(from)
+        guard span > 0, samples.count > maxPoints else {
+            return samples.map { UsageTrend.Point(date: $0.timestamp, percent: $0.percent) }
+        }
+
+        func bucket(_ sample: UsageSample) -> Int {
+            let offset = sample.timestamp.timeIntervalSince(from) / span
+            return min(maxPoints - 1, max(0, Int(offset * Double(maxPoints))))
+        }
+
+        // Keep the very first sample so the line starts where recording did,
+        // then one per bucket as each one closes.
+        var kept: [UsageSample] = [samples[0]]
+        var openBucket = bucket(samples[0])
+        var newestInBucket = samples[0]
+        for sample in samples.dropFirst() {
+            let index = bucket(sample)
+            if index != openBucket {
+                if newestInBucket.timestamp != kept[kept.count - 1].timestamp {
+                    kept.append(newestInBucket)
+                }
+                openBucket = index
+            }
+            newestInBucket = sample
+        }
+        if newestInBucket.timestamp != kept[kept.count - 1].timestamp {
+            kept.append(newestInBucket)
+        }
+        return kept.map { UsageTrend.Point(date: $0.timestamp, percent: $0.percent) }
+    }
+
     /// Regression over the current window's recent samples, gated on having
     /// enough of them to mean something.
     private func fit(accountID: String, limitID: String) -> (
@@ -145,16 +302,20 @@ final class UsageHistoryStore {
         guard let latest = all.last else { return [] }
 
         let cutoff = latest.timestamp.addingTimeInterval(-lookback(for: latest))
-        var window = all.filter { $0.timestamp >= cutoff }
-        guard window.count >= 2 else { return window }
+        return trimAtLastReset(all.filter { $0.timestamp >= cutoff })
+    }
 
+    /// Drops everything up to and including the most recent window reset, so
+    /// no caller ever reads across one. A reset shows up as a percent drop
+    /// bigger than rounding jitter.
+    private func trimAtLastReset(_ samples: [UsageSample]) -> [UsageSample] {
+        guard samples.count >= 2 else { return samples }
         var start = 0
-        for index in 1..<window.count
-        where window[index].percent < window[index - 1].percent - resetDropThreshold {
+        for index in 1..<samples.count
+        where samples[index].percent < samples[index - 1].percent - resetDropThreshold {
             start = index
         }
-        if start > 0 { window.removeFirst(start) }
-        return window
+        return start > 0 ? Array(samples[start...]) : samples
     }
 
     /// Session windows fill fast, so hours-old samples mislead; weekly

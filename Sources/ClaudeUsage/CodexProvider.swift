@@ -275,7 +275,9 @@ struct CodexProvider: UsageProvider {
                     percent: percent,
                     resetsAt: window.resetAt.map { Date(timeIntervalSince1970: $0) },
                     isActive: false,
-                    sortOrder: sortOrder
+                    sortOrder: sortOrder,
+                    // This backend states the window length outright.
+                    windowSeconds: window.limitWindowSeconds
                 ))
         }
 
