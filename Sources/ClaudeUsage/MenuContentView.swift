@@ -583,9 +583,18 @@ struct BestBadge: View {
     }
 
     private var tooltip: String {
-        // Expiring-first (v3): explain what is about to vanish and when.
+        // Expiring-first (v3/v4): explain what is about to vanish and when.
         if let expiring = badge.expiring {
             let untilReset = AccountSection.durationText(until: expiring.resetsAt)
+            // The weekly leg (v4) names the window, since "31% expires in 3d"
+            // would otherwise read as a session figure. "Weekly" reads better
+            // lowercased inside the sentence; model-scoped windows keep their
+            // proper name ("of Fable").
+            if let scope = expiring.scopeName {
+                let name = scope == "Weekly" ? "weekly" : scope
+                return "≈\(Int(expiring.points.rounded()))% of \(name) expires at reset in "
+                    + "\(untilReset) — use this first"
+            }
             return "≈\(Int(expiring.points.rounded()))% expires at reset in "
                 + "\(untilReset) — use this first"
         }
