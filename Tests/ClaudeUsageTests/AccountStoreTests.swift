@@ -889,6 +889,49 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(projected.timeIntervalSince(expected), 0, accuracy: 900)
     }
 
+    // MARK: Trend charts
+
+    func testExpandedTrendChartsSurviveARelaunch() {
+        let account = makeAccount()
+        let harness = makeHarness(accounts: [account])
+        let key = "\(account.id)|weekly_all|"
+
+        XCTAssertFalse(harness.store.isTrendExpanded(key))
+        harness.store.toggleTrend(key)
+        XCTAssertTrue(harness.store.isTrendExpanded(key))
+
+        // A store rebuilt on the same defaults — i.e. the next launch — opens
+        // with the same chart showing.
+        let relaunched = makeHarness(accounts: [account], defaults: harness.defaults)
+        XCTAssertTrue(relaunched.store.isTrendExpanded(key))
+
+        relaunched.store.toggleTrend(key)
+        let afterCollapse = makeHarness(accounts: [account], defaults: harness.defaults)
+        XCTAssertFalse(afterCollapse.store.isTrendExpanded(key))
+    }
+
+    func testTrendReadsRecordedHistoryForTheAccount() async throws {
+        let account = makeAccount()
+        let weekly = LimitStatus(
+            id: "weekly_all|", name: "Weekly", percent: 40,
+            resetsAt: Date().addingTimeInterval(3 * 86400), isActive: false, sortOrder: 1,
+            windowSeconds: 7 * 86400)
+        let provider = ProviderFake(
+            fetchResult: .success(UsageSnapshot(limits: [weekly], credits: nil)))
+        let harness = makeHarness(
+            provider: provider, accounts: [account], vault: [account.id: makeTokens()])
+
+        // No polls yet: nothing recorded inside the window, so no chart.
+        XCTAssertNil(harness.store.trend(for: weekly, accountID: account.id))
+
+        await harness.store.refresh(account: account, force: true)
+        let trend = try XCTUnwrap(harness.store.trend(for: weekly, accountID: account.id))
+        XCTAssertEqual(trend.recorded.count, 1)
+        XCTAssertEqual(trend.latest.percent, 40)
+        // One sample can be drawn but not fitted, so there's no projection.
+        XCTAssertTrue(trend.projected.isEmpty)
+    }
+
     // MARK: Notifier wiring
 
     func testRefreshFeedsNotifierWithOldAndNewStates() async {

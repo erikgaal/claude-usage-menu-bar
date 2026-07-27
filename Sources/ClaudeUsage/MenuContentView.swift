@@ -423,6 +423,56 @@ struct AccountSection: View {
                             .foregroundStyle(.secondary)
                             .padding(.leading, LimitRow.labelWidth + LimitRow.spacing)
                     }
+                    trendSection(for: group)
+                }
+            }
+        }
+    }
+
+    // MARK: Trend charts
+
+    /// Collapsible trend charts for a reset group's multi-day windows — the
+    /// only ones where a week of recorded history and an end-of-window
+    /// projection say anything (see `LimitStatus.isMultiDay`). Session groups
+    /// get nothing here, so the panel stays as short as it is today.
+    ///
+    /// Collapsed by default and remembered per limit: three accounts' charts
+    /// unfurled at once would make the panel taller than most screens, but a
+    /// chart the user opened is one they want to keep seeing.
+    @ViewBuilder
+    private func trendSection(for group: ResetGroup) -> some View {
+        let chartable = group.rows.filter(\.isMultiDay)
+        if let first = chartable.first {
+            let key = "\(account.id)|\(first.id)"
+            let isExpanded = store.isTrendExpanded(key)
+            VStack(alignment: .leading, spacing: 10) {
+                Button {
+                    store.toggleTrend(key)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                        Text(chartable.count > 1 ? "Trends" : "\(first.name) trend")
+                            .font(.caption)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .padding(.leading, LimitRow.labelWidth + LimitRow.spacing)
+                .help("Recorded usage across this window, and where the current pace lands")
+
+                if isExpanded {
+                    ForEach(chartable) { limit in
+                        if let trend = store.trend(for: limit, accountID: account.id) {
+                            UsageTrendChart(
+                                limit: limit, trend: trend, showsTitle: chartable.count > 1)
+                        } else {
+                            Text("\(limit.name): nothing recorded in this window yet.")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
                 }
             }
         }

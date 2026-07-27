@@ -10,11 +10,16 @@ final class AccountStore: ObservableObject {
     @Published private(set) var pendingProvider: ProviderID?
     @Published var addAccountError: String?
     @Published var launchAtLogin: Bool = SMAppService.mainApp.status == .enabled
+    /// Trend charts the user has expanded, keyed "accountID|limitID" (see
+    /// `toggleTrend`). Persisted, so an opened chart is still open the next
+    /// time the panel — or the app — comes back.
+    @Published private(set) var expandedTrends: Set<String> = []
 
     /// Local-notification manager; `refresh` feeds it old/new state diffs.
     let notifier: UsageNotifier
 
     private let defaultsKey = "accounts"
+    private let expandedTrendsKey = "expandedTrends"
     /// Background poll cadence. The panel also refreshes on open when stale.
     private let pollInterval: TimeInterval = 300
     /// Consider data stale (worth refreshing on panel open) after this long.
@@ -75,6 +80,7 @@ final class AccountStore: ObservableObject {
             if Mock.isEnabled {
                 accounts = Mock.accounts
                 states = Mock.states
+                expandedTrends = Mock.expandedTrends
                 vaultLoaded = true
                 return
             }
@@ -184,6 +190,29 @@ final class AccountStore: ObservableObject {
         return rates
     }
 
+    // MARK: - Trend charts
+
+    /// Recorded-and-projected series for one of an account's limits, read from
+    /// the store's own history — so views never hold a history dependency and
+    /// tests can drive the charts through an injected store.
+    func trend(for limit: LimitStatus, accountID: String) -> UsageTrend? {
+        history.trend(for: limit, accountID: accountID)
+    }
+
+    func isTrendExpanded(_ key: String) -> Bool { expandedTrends.contains(key) }
+
+    /// Shows/hides a trend chart. The key identifies the chart's limit
+    /// ("accountID|limitID") so each account's charts are remembered
+    /// independently.
+    func toggleTrend(_ key: String) {
+        if expandedTrends.contains(key) {
+            expandedTrends.remove(key)
+        } else {
+            expandedTrends.insert(key)
+        }
+        defaults.set(Array(expandedTrends), forKey: expandedTrendsKey)
+    }
+
     // MARK: - Account management
 
     func beginAddAccount(provider providerID: ProviderID) {
@@ -245,6 +274,10 @@ final class AccountStore: ObservableObject {
         persistVault()
         keychain.delete(account: account.id)  // legacy per-account item, if any
         history.removeHistory(accountID: account.id)
+        // Chart keys are account-prefixed; drop this account's so removed
+        // accounts don't leave entries behind in UserDefaults forever.
+        expandedTrends = expandedTrends.filter { !$0.hasPrefix("\(account.id)|") }
+        defaults.set(Array(expandedTrends), forKey: expandedTrendsKey)
         persistAccounts()
     }
 
@@ -457,6 +490,7 @@ final class AccountStore: ObservableObject {
     // MARK: - Persistence
 
     private func loadAccounts() {
+        expandedTrends = Set(defaults.stringArray(forKey: expandedTrendsKey) ?? [])
         guard let data = defaults.data(forKey: defaultsKey),
             let decoded = try? JSONDecoder().decode([AccountMeta].self, from: data)
         else { return }
