@@ -68,9 +68,13 @@ struct BestAccountDebugView: View {
             if trace.aggregatePace > 0,
                 let percent = candidate.atRiskPercent,
                 let atRiskUnits = candidate.atRiskUnits {
+                // A refilling session window is held at zero on purpose (v5);
+                // say so, or the 0 reads as a missing signal.
                 Text(
-                    "≈\(Int(percent.rounded()))% at risk before reset "
-                        + "(\(units(atRiskUnits)))")
+                    candidate.sessionRefills
+                        ? "session refills before the weekly reset — nothing at risk"
+                        : "≈\(Int(percent.rounded()))% at risk before reset "
+                            + "(\(units(atRiskUnits)))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -97,6 +101,12 @@ struct BestAccountDebugView: View {
             return "reset"
         }
         return "reset in \(AccountSection.durationText(until: resetsAt))"
+    }
+
+    /// A bare interval as "2d 15h" — `AccountSection.durationText` measures
+    /// from now, and this is a gap between two future resets.
+    private func leadText(_ seconds: TimeInterval) -> String {
+        AccountSection.durationText(until: Date().addingTimeInterval(seconds))
     }
 
     private func planText(_ candidate: BestAccount.CandidateTrace) -> String {
@@ -183,12 +193,19 @@ struct BestAccountDebugView: View {
             var expiring =
                 "\(name): \(label(award.badgedID)) has \(units(award.atRiskUnits)) "
                 + "at risk (floor ≥ \(units(floorUnits(of: award.leg))))"
+            // Which comparisons it had to win (v5). Both can apply: beating a
+            // rival that shares its deadline on size, and leading everyone
+            // later on the clock.
+            var beats: [String] = []
             if let gap = award.atRiskGapUnits {
-                expiring += ", leads by \(units(gap)) "
-                    + "(needs ≥ \(units(marginUnits(of: award.leg))))."
-            } else {
-                expiring += "."
+                beats.append(
+                    "leads its same-reset rival by \(units(gap)) "
+                        + "(needs ≥ \(units(marginUnits(of: award.leg))))")
             }
+            if let lead = award.deadlineLeadSeconds {
+                beats.append("resets \(leadText(lead)) before the next account")
+            }
+            expiring += beats.isEmpty ? "." : ", " + beats.joined(separator: ", ") + "."
             lines.append(expiring)
             lines.append("Best: \(label(award.badgedID)) — use it before its reset.")
             return lines

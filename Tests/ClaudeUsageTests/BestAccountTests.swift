@@ -1107,7 +1107,10 @@ final class BestAccountTests: XCTestCase {
         }
         XCTAssertEqual(award.badgedID, "work")
         XCTAssertEqual(award.atRiskUnits, 0.4, accuracy: 1e-12)
-        XCTAssertEqual(try XCTUnwrap(award.atRiskGapUnits), 0.4, accuracy: 1e-12)
+        // Personal has nothing at risk, so it never qualifies: there is
+        // neither a same-reset rival to out-size nor a later deadline to lead.
+        XCTAssertNil(award.atRiskGapUnits)
+        XCTAssertNil(award.deadlineLeadSeconds)
         XCTAssertEqual(try XCTUnwrap(award.badge.expiring?.points), 40, accuracy: 1e-9)
         XCTAssertEqual(
             award.badge.expiring?.resetsAt, Self.now.addingTimeInterval(3600))
@@ -1395,6 +1398,72 @@ final class BestAccountTests: XCTestCase {
         XCTAssertNil(result["work"]?.projectedExhaustion)
     }
 
+    func testV5LiveScenarioBadgesTheAccountWhoseWeekEndsFirst() throws {
+        // The panel that prompted v5. Work is 56% into a week that resets in
+        // 1d 2h; Work Alt is 30% into one with 3d 17h to run. v4 badged Work
+        // Alt, on both counts wrongly: the session leg fired first on Work
+        // Alt's 1.72 units of expiring *session* capacity — capacity that
+        // refills at 3h 22m and was never scarce — and had it stood down, the
+        // weekly leg would have picked Work Alt anyway for holding the larger
+        // pile (1.61 units against 1.20) behind the later deadline.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (
+                makeAccount("work"),
+                makeState(
+                    session: 4, sessionResetIn: 120,
+                    weekly: [
+                        Weekly(percent: 56, resetIn: 26 * 3600),
+                        Weekly(name: "Fable", percent: 55, resetIn: 26 * 3600),
+                    ])
+            ),
+            (
+                makeAccount("alt"),
+                makeState(
+                    session: 15, sessionResetIn: 3 * 3600 + 22 * 60,
+                    weekly: [
+                        Weekly(percent: 30, resetIn: 89 * 3600),
+                        Weekly(name: "Fable", percent: 15, resetIn: 89 * 3600),
+                    ])
+            ),
+        ]
+        let sessionRates = ["work": 6.4, "alt": 4.0]
+        let weeklyRates = [
+            "work": rates(byWindow: ["Weekly": 0.5, "Fable": 0.5]),
+            "alt": rates(byWindow: ["Weekly": 0.42, "Fable": 0.42]),
+        ]
+        let mults = ["work": 5.0, "alt": 5.0]
+        let trace = try XCTUnwrap(
+            traces(pairs, rates: sessionRates, weeklyRates: weeklyRates, multipliers: mults)
+                .first)
+        XCTAssertEqual(trace.aggregatePace, 0.52, accuracy: 1e-9)
+
+        // Both session windows refill long before their weeks end, so the
+        // session leg has nothing to say — including Work Alt's 1.72 units.
+        XCTAssertTrue(try XCTUnwrap(candidate("alt", in: trace)?.sessionRefills))
+        XCTAssertEqual(candidate("alt", in: trace)?.atRiskUnits, 0)
+        XCTAssertEqual(trace.capacityFallback, .belowFloor(topAtRiskUnits: 0))
+
+        // On the weekly leg Alt still has more at risk — and still loses, by
+        // 63 hours of deadline.
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("work", in: trace)?.weeklyAtRiskUnits), 1.196,
+            accuracy: 1e-9)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("alt", in: trace)?.weeklyAtRiskUnits), 1.606,
+            accuracy: 1e-9)
+        let award = try expiringAward(of: trace)
+        XCTAssertEqual(award.leg, .weekly)
+        XCTAssertEqual(award.badgedID, "work")
+        XCTAssertEqual(try XCTUnwrap(award.deadlineLeadSeconds), 63 * 3600, accuracy: 1e-9)
+        XCTAssertEqual(award.badge.expiring?.resetsAt, Self.now.addingTimeInterval(26 * 3600))
+        XCTAssertEqual(award.badge.expiring?.scopeName, "Weekly")
+        XCTAssertEqual(
+            Set(
+                badges(
+                    pairs, rates: sessionRates, weeklyRates: weeklyRates, multipliers: mults
+                ).keys), ["work"])
+    }
+
     func testIssue21InvertedSessionsStillBadgeWork() {
         // The case the session-only logic got wrong: flip the session
         // percents and v2 headroom favours Alt (5% vs 23%, well over the
@@ -1554,14 +1623,15 @@ final class BestAccountTests: XCTestCase {
         XCTAssertNil(underFloor["b"]?.expiring)
     }
 
-    func testWeeklyAtRiskMarginBoundary() {
+    func testWeeklyLegFloorQualifiesBeforeTheDeadlineRanks() {
         // Two Max 5× accounts, both 90% through the week, 0.005 units/h of
         // pooled weekly demand: a's reset is 50 h out (0.25 units at risk),
-        // b's 30 h out (0.15) — a gap of exactly 0.10 units, the inclusive
-        // margin, so the weekly leg fires for a.
+        // b's 30 h out (0.15). b holds the nearer deadline but falls under the
+        // 0.20 floor, so it never qualifies and a — the only account with a
+        // meaningful amount expiring — takes the badge.
         let mults = ["a": 5.0, "b": 5.0]
         let weekly = ["a": rates(byWindow: ["Weekly": 0.1])]
-        let atMargin = badges(
+        let belowFloor = badges(
             [
                 (
                     makeAccount("a"),
@@ -1573,12 +1643,14 @@ final class BestAccountTests: XCTestCase {
                 ),
             ],
             weeklyRates: weekly, multipliers: mults)
-        XCTAssertEqual(Set(atMargin.keys), ["a"])
-        XCTAssertEqual(atMargin["a"]?.expiring?.points, 5)
+        XCTAssertEqual(Set(belowFloor.keys), ["a"])
+        XCTAssertEqual(belowFloor["a"]?.expiring?.points, 5)
 
-        // Stretching b's reset to 32 h lifts its at-risk to 0.16 units: the
-        // gap (0.09) is under the margin, so v2 decides and badges b.
-        let underMargin = badges(
+        // Raising the pooled demand to 0.008 units/h lifts b to 0.24 units and
+        // a to 0.40 — both now clear the floor, and the verdict flips to b
+        // even though a still has more at risk, because b's week ends 20 h
+        // sooner. a's larger pile is still there to work through afterwards.
+        let bothQualify = badges(
             [
                 (
                     makeAccount("a"),
@@ -1586,21 +1658,62 @@ final class BestAccountTests: XCTestCase {
                 ),
                 (
                     makeAccount("b"),
-                    makeState(session: 10, weekly: [Weekly(percent: 90, resetIn: 32 * 3600)])
+                    makeState(session: 10, weekly: [Weekly(percent: 90, resetIn: 30 * 3600)])
                 ),
             ],
-            weeklyRates: weekly, multipliers: mults)
-        XCTAssertEqual(Set(underMargin.keys), ["b"])
-        XCTAssertNil(underMargin["b"]?.expiring)
+            weeklyRates: ["a": rates(byWindow: ["Weekly": 0.16])], multipliers: mults)
+        XCTAssertEqual(Set(bothQualify.keys), ["b"])
+        XCTAssertEqual(
+            bothQualify["b"]?.expiring?.resetsAt, Self.now.addingTimeInterval(30 * 3600))
     }
 
-    func testSessionLegDecidesBeforeWeeklyLegEvenWhenWeeklyIsLarger() throws {
-        // Strict priority, the whole point of v4: issue #19's worked example
-        // puts 0.40 units at risk on work's session window, while personal
-        // has twice that — 0.80 units — at risk on its weekly window. The
-        // shorter clock wins outright; the numbers are never compared, which
-        // they couldn't honestly be (a session percent and a weekly percent
-        // measure differently sized windows).
+    func testWeeklyLegSharedDeadlineFallsBackToSize() throws {
+        // Two accounts whose weeks end at the same moment have — always, by
+        // the shape of `atRiskCapacity` — the same amount at risk: whichever
+        // has the smaller headroom caps both. So a shared deadline in a pair
+        // is a dead heat on the expiring axis, the margin catches it, and v2
+        // decides on session headroom.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (
+                makeAccount("a"),
+                makeState(session: 40, weekly: [Weekly(percent: 90, resetIn: 30 * 3600)])
+            ),
+            (
+                makeAccount("b"),
+                makeState(session: 10, weekly: [Weekly(percent: 60, resetIn: 30 * 3600)])
+            ),
+        ]
+        let rates = ["a": rates(byWindow: ["Weekly": 0.4])]
+        let mults = ["a": 5.0, "b": 5.0]
+        let trace = try XCTUnwrap(traces(pairs, weeklyRates: rates, multipliers: mults).first)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("a", in: trace)?.weeklyAtRiskUnits), 0.5, accuracy: 1e-9)
+        XCTAssertEqual(
+            try XCTUnwrap(candidate("b", in: trace)?.weeklyAtRiskUnits), 0.5, accuracy: 1e-9)
+        // Ties keep the incoming headroom order, so b (10% session) leads.
+        guard case .atRiskTooClose(let leaderID, let runnerUpID, let gapUnits) =
+            trace.weeklyCapacityFallback
+        else {
+            return XCTFail(
+                "expected a too-close weekly fallback, got "
+                    + String(describing: trace.weeklyCapacityFallback))
+        }
+        XCTAssertEqual(leaderID, "b")
+        XCTAssertEqual(runnerUpID, "a")
+        XCTAssertEqual(gapUnits, 0, accuracy: 1e-9)
+        let result = badges(pairs, weeklyRates: rates, multipliers: mults)
+        XCTAssertEqual(Set(result.keys), ["b"])
+        XCTAssertNil(result["b"]?.expiring)
+    }
+
+    func testSessionLegStandsDownWhenTheWindowSimplyRefills() throws {
+        // v4 gave the session leg strict priority on the grounds that it holds
+        // the shorter clock, and this fixture is what that cost: work has 0.40
+        // units expiring with its session window in an hour, personal twice
+        // that — 0.80 units — expiring with its week. But work's own week runs
+        // another 200 hours, so a fresh session window opens in an hour and
+        // the same quota is spendable then; nothing is actually lost. The
+        // session leg must stand down and let the weekly leg speak.
         let pairs: [(AccountMeta, AccountDisplayState?)] = [
             (
                 makeAccount("work"),
@@ -1615,16 +1728,52 @@ final class BestAccountTests: XCTestCase {
                     weekly: [Weekly(percent: 20, resetIn: 20 * 3600)])
             ),
         ]
+        let weeklyRates = ["personal": rates(byWindow: ["Weekly": 4.25])]
+        let sessionRates = ["work": 35.0, "personal": 25.0]
         let trace = try XCTUnwrap(
-            traces(
-                pairs, rates: ["work": 35, "personal": 25],
-                weeklyRates: ["personal": rates(byWindow: ["Weekly": 4.25])]
-            ).first)
-        // Both legs are traced; only the session one decided.
-        XCTAssertEqual(candidate("work", in: trace)?.atRiskUnits, 0.4)
+            traces(pairs, rates: sessionRates, weeklyRates: weeklyRates).first)
+        // Both accounts refill: neither session window is anyone's last call.
+        XCTAssertTrue(try XCTUnwrap(candidate("work", in: trace)?.sessionRefills))
+        XCTAssertTrue(try XCTUnwrap(candidate("personal", in: trace)?.sessionRefills))
+        XCTAssertEqual(candidate("work", in: trace)?.atRiskUnits, 0)
+        XCTAssertEqual(trace.capacityFallback, .belowFloor(topAtRiskUnits: 0))
+        // The weekly leg decides, on the only real loss in the group.
+        XCTAssertNil(trace.weeklyCapacityFallback)
+        let award = try expiringAward(of: trace)
+        XCTAssertEqual(award.leg, .weekly)
+        XCTAssertEqual(award.badgedID, "personal")
+        XCTAssertEqual(try XCTUnwrap(award.atRiskUnits), 0.8, accuracy: 1e-9)
         XCTAssertEqual(
-            try XCTUnwrap(candidate("personal", in: trace)?.weeklyAtRiskUnits), 0.8,
-            accuracy: 1e-9)
+            Set(badges(pairs, rates: sessionRates, weeklyRates: weeklyRates).keys),
+            ["personal"])
+    }
+
+    func testSessionLegFiresWhenTheWeeklyResetCutsTheNextWindowShort() throws {
+        // The same shape, except work's week now ends five hours out — before
+        // the session window opening in an hour could run its full five. This
+        // one really is the last full chance to spend that week, so the
+        // session leg keeps its priority and its 0.40 units win outright over
+        // personal's larger weekly loss.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (
+                makeAccount("work"),
+                makeState(
+                    session: 60, sessionResetIn: 3600,
+                    weekly: [Weekly(percent: 10, resetIn: 5 * 3600)])
+            ),
+            (
+                makeAccount("personal"),
+                makeState(
+                    session: 30, sessionResetIn: 4 * 3600,
+                    weekly: [Weekly(percent: 20, resetIn: 20 * 3600)])
+            ),
+        ]
+        let weeklyRates = ["personal": rates(byWindow: ["Weekly": 4.25])]
+        let sessionRates = ["work": 35.0, "personal": 25.0]
+        let trace = try XCTUnwrap(
+            traces(pairs, rates: sessionRates, weeklyRates: weeklyRates).first)
+        XCTAssertFalse(try XCTUnwrap(candidate("work", in: trace)?.sessionRefills))
+        XCTAssertEqual(candidate("work", in: trace)?.atRiskUnits, 0.4)
         XCTAssertNil(trace.capacityFallback)
         XCTAssertNil(
             trace.weeklyCapacityFallback,
@@ -1635,11 +1784,42 @@ final class BestAccountTests: XCTestCase {
         XCTAssertEqual(award.atRiskUnits, 0.4)
         // Session tooltips are unchanged — no window name.
         XCTAssertNil(award.badge.expiring?.scopeName)
-        XCTAssertEqual(Set(
-            badges(
-                pairs, rates: ["work": 35, "personal": 25],
-                weeklyRates: ["personal": rates(byWindow: ["Weekly": 4.25])]
-            ).keys), ["work"])
+        XCTAssertEqual(
+            Set(badges(pairs, rates: sessionRates, weeklyRates: weeklyRates).keys), ["work"])
+    }
+
+    func testSessionLegFiresForAnAccountWithNoWeeklyWindow() throws {
+        // Nothing above the session window bounds this account, so its
+        // sessions are the whole budget and a lapsed one is capacity that
+        // never returns — the refill gate must not silence the leg here.
+        let pairs: [(AccountMeta, AccountDisplayState?)] = [
+            (
+                makeAccount("work"),
+                makeState(
+                    limits: [
+                        LimitStatus(
+                            id: "session|", name: "Session", percent: 60,
+                            resetsAt: Self.now.addingTimeInterval(3600),
+                            isActive: false, sortOrder: 0, windowSeconds: 5 * 3600)
+                    ])
+            ),
+            (
+                makeAccount("personal"),
+                makeState(
+                    limits: [
+                        LimitStatus(
+                            id: "session|", name: "Session", percent: 30,
+                            resetsAt: Self.now.addingTimeInterval(4 * 3600),
+                            isActive: false, sortOrder: 0, windowSeconds: 5 * 3600)
+                    ])
+            ),
+        ]
+        let trace = try XCTUnwrap(
+            traces(pairs, rates: ["work": 35, "personal": 25]).first)
+        XCTAssertFalse(try XCTUnwrap(candidate("work", in: trace)?.sessionRefills))
+        let award = try expiringAward(of: trace)
+        XCTAssertEqual(award.leg, .session)
+        XCTAssertEqual(award.badgedID, "work")
     }
 
     func testWeeklyLegPicksTheWindowWithMostAtRisk() throws {
@@ -2018,7 +2198,11 @@ final class BestAccountTests: XCTestCase {
         XCTAssertEqual(award.leg, .weekly)
         XCTAssertEqual(award.badgedID, "work")
         XCTAssertEqual(award.atRiskUnits, 3.45, accuracy: 1e-9)
-        XCTAssertEqual(try XCTUnwrap(award.atRiskGapUnits), 2.5, accuracy: 1e-9)
+        // Alt qualifies too (0.95 units), but its week runs 2d 15h longer, so
+        // the deadline settles it and size never enters into it.
+        XCTAssertNil(award.atRiskGapUnits)
+        XCTAssertEqual(
+            try XCTUnwrap(award.deadlineLeadSeconds), 2 * 86400 + 15 * 3600, accuracy: 1e-9)
         XCTAssertEqual(award.badge.expiring?.scopeName, "Weekly")
     }
 
