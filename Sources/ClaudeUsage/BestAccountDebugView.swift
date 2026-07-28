@@ -187,7 +187,8 @@ struct BestAccountDebugView: View {
             // The weekly leg is only ever reached because the session leg
             // stood down, so show that stand-down reason first (issue #21).
             if award.leg == .weekly {
-                lines += fallbackLines(trace.capacityFallback, leg: .session)
+                lines += fallbackLines(
+                    trace.capacityFallback, leg: .session, handingOff: true)
             }
             let name = legName(award.leg)
             var expiring =
@@ -222,23 +223,30 @@ struct BestAccountDebugView: View {
 
     /// Why one leg stood down, in its own units and against its own
     /// constants — nothing when that leg decided or was never consulted.
+    ///
+    /// `handingOff` says a later leg went on to decide, so the line must not
+    /// claim the headroom ranking took over. Since v5 narrowed the session leg
+    /// to windows that don't simply refill, standing down and handing off to
+    /// the weekly leg is its ordinary outcome rather than a rare one.
     private func fallbackLines(
-        _ fallback: BestAccount.CapacityFallback?, leg: BestAccount.ExpiringAward.Leg
+        _ fallback: BestAccount.CapacityFallback?, leg: BestAccount.ExpiringAward.Leg,
+        handingOff: Bool = false
     ) -> [String] {
         let name = legName(leg)
+        let outcome = handingOff ? "deferring to the weekly leg" : "using headroom ranking"
         switch fallback {
         case .noAggregatePace:
-            return ["\(name): no burn-rate data — using headroom ranking."]
+            return ["\(name): no burn-rate data — \(outcome)."]
         case .belowFloor(let topAtRiskUnits):
             return [
                 "\(name): at most \(units(topAtRiskUnits)) at risk "
-                    + "(floor ≥ \(units(floorUnits(of: leg)))) — using headroom ranking."
+                    + "(floor ≥ \(units(floorUnits(of: leg)))) — \(outcome)."
             ]
         case .atRiskTooClose(let leaderID, let runnerUpID, let gapUnits):
             return [
                 "\(name): \(label(leaderID)) leads \(label(runnerUpID)) by only "
                     + "\(units(gapUnits)) at risk (needs ≥ \(units(marginUnits(of: leg)))) "
-                    + "— using headroom ranking."
+                    + "— \(outcome)."
             ]
         case nil:
             return []
