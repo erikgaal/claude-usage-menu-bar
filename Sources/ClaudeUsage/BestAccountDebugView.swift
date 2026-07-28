@@ -68,9 +68,13 @@ struct BestAccountDebugView: View {
             if trace.aggregatePace > 0,
                 let percent = candidate.atRiskPercent,
                 let atRiskUnits = candidate.atRiskUnits {
+                // A refilling session window is held at zero on purpose (v5);
+                // say so, or the 0 reads as a missing signal.
                 Text(
-                    "≈\(Int(percent.rounded()))% at risk before reset "
-                        + "(\(units(atRiskUnits)))")
+                    candidate.sessionRefills
+                        ? "session refills before the weekly reset — nothing at risk"
+                        : "≈\(Int(percent.rounded()))% at risk before reset "
+                            + "(\(units(atRiskUnits)))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -97,6 +101,12 @@ struct BestAccountDebugView: View {
             return "reset"
         }
         return "reset in \(AccountSection.durationText(until: resetsAt))"
+    }
+
+    /// A bare interval as "2d 15h" — `AccountSection.durationText` measures
+    /// from now, and this is a gap between two future resets.
+    private func leadText(_ seconds: TimeInterval) -> String {
+        AccountSection.durationText(until: Date().addingTimeInterval(seconds))
     }
 
     private func planText(_ candidate: BestAccount.CandidateTrace) -> String {
@@ -177,18 +187,26 @@ struct BestAccountDebugView: View {
             // The weekly leg is only ever reached because the session leg
             // stood down, so show that stand-down reason first (issue #21).
             if award.leg == .weekly {
-                lines += fallbackLines(trace.capacityFallback, leg: .session)
+                lines += fallbackLines(
+                    trace.capacityFallback, leg: .session, handingOff: true)
             }
             let name = legName(award.leg)
             var expiring =
                 "\(name): \(label(award.badgedID)) has \(units(award.atRiskUnits)) "
                 + "at risk (floor ≥ \(units(floorUnits(of: award.leg))))"
+            // Which comparisons it had to win (v5). Both can apply: beating a
+            // rival that shares its deadline on size, and leading everyone
+            // later on the clock.
+            var beats: [String] = []
             if let gap = award.atRiskGapUnits {
-                expiring += ", leads by \(units(gap)) "
-                    + "(needs ≥ \(units(marginUnits(of: award.leg))))."
-            } else {
-                expiring += "."
+                beats.append(
+                    "leads its same-reset rival by \(units(gap)) "
+                        + "(needs ≥ \(units(marginUnits(of: award.leg))))")
             }
+            if let lead = award.deadlineLeadSeconds {
+                beats.append("resets \(leadText(lead)) before the next account")
+            }
+            expiring += beats.isEmpty ? "." : ", " + beats.joined(separator: ", ") + "."
             lines.append(expiring)
             lines.append("Best: \(label(award.badgedID)) — use it before its reset.")
             return lines
@@ -205,23 +223,30 @@ struct BestAccountDebugView: View {
 
     /// Why one leg stood down, in its own units and against its own
     /// constants — nothing when that leg decided or was never consulted.
+    ///
+    /// `handingOff` says a later leg went on to decide, so the line must not
+    /// claim the headroom ranking took over. Since v5 narrowed the session leg
+    /// to windows that don't simply refill, standing down and handing off to
+    /// the weekly leg is its ordinary outcome rather than a rare one.
     private func fallbackLines(
-        _ fallback: BestAccount.CapacityFallback?, leg: BestAccount.ExpiringAward.Leg
+        _ fallback: BestAccount.CapacityFallback?, leg: BestAccount.ExpiringAward.Leg,
+        handingOff: Bool = false
     ) -> [String] {
         let name = legName(leg)
+        let outcome = handingOff ? "deferring to the weekly leg" : "using headroom ranking"
         switch fallback {
         case .noAggregatePace:
-            return ["\(name): no burn-rate data — using headroom ranking."]
+            return ["\(name): no burn-rate data — \(outcome)."]
         case .belowFloor(let topAtRiskUnits):
             return [
                 "\(name): at most \(units(topAtRiskUnits)) at risk "
-                    + "(floor ≥ \(units(floorUnits(of: leg)))) — using headroom ranking."
+                    + "(floor ≥ \(units(floorUnits(of: leg)))) — \(outcome)."
             ]
         case .atRiskTooClose(let leaderID, let runnerUpID, let gapUnits):
             return [
                 "\(name): \(label(leaderID)) leads \(label(runnerUpID)) by only "
                     + "\(units(gapUnits)) at risk (needs ≥ \(units(marginUnits(of: leg)))) "
-                    + "— using headroom ranking."
+                    + "— \(outcome)."
             ]
         case nil:
             return []

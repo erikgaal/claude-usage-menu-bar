@@ -59,6 +59,15 @@ enum BestAccount {
     /// produces (issue #21's live data: 3.45 vs 0.95 units). Inclusive, like
     /// `margin`.
     static let weeklyAtRiskMargin = 0.10
+    /// How much earlier one account's reset must fall before a leg treats it
+    /// as the nearer deadline (v5). Resets closer together than this are
+    /// effectively simultaneous — two windows expiring 10 minutes apart offer
+    /// no meaningful "go here first" advice — and are judged on at-risk size
+    /// instead, via `atRiskMargin`/`weeklyAtRiskMargin`. Unlike those, this
+    /// needs no anti-flap slack of its own: reset timestamps are fixed points,
+    /// not refitted estimates, so the ordering they induce doesn't wobble
+    /// between polls.
+    static let deadlineMargin: TimeInterval = 30 * 60
 
     // MARK: - Badge
 
@@ -142,6 +151,11 @@ enum BestAccount {
         let sessionPercent: Double?
         /// When the session window resets, straight from the limit.
         let sessionResetsAt: Date?
+        /// How long the session window runs, when the limit states it — the
+        /// length of the *replacement* window the next reset opens, which is
+        /// what decides whether letting this one lapse costs anything (see
+        /// `attachAtRisk`). Nil when the provider names no duration.
+        let sessionWindowSeconds: TimeInterval?
         /// Raw session burn rate from history (%/hour); nil when unknown.
         let burnRate: Double?
         /// The account's plan multiplier as supplied (Pro ×1, Max ×5/×20),
@@ -155,7 +169,13 @@ enum BestAccount {
         /// unless the user burns it first, in pooled quota units (one full
         /// Pro window = 1.0) — see `atRiskCapacity(...)`. Nil for vetoed
         /// candidates: they don't take part in the expiring-first ranking.
+        /// Zeroed when `sessionRefills` is true.
         var atRiskUnits: Double?
+        /// Whether a fresh session window arrives in time to spend the same
+        /// quota anyway, which makes this session's expiry costless (v5) —
+        /// see `attachAtRisk`. When true, `atRiskUnits` is held at zero and
+        /// the account cannot win the session leg.
+        var sessionRefills: Bool = false
         /// The same at-risk expressed in this account's own window percent
         /// (units × 100 ÷ effective multiplier), for display.
         var atRiskPercent: Double?
@@ -233,11 +253,16 @@ enum BestAccount {
         let badgedID: String
         /// The badged account's at-risk capacity, in pooled quota units.
         let atRiskUnits: Double
-        /// Lead over the runner-up's at-risk capacity, in units; nil when
-        /// the badged account is the sole eligible candidate (unreachable
-        /// today — a sole account has zero at-risk, see `atRiskCapacity` —
-        /// but kept honest rather than force-unwrapped).
+        /// Lead over the at-risk capacity of the nearest rival sharing this
+        /// deadline, in units — the comparison that decided the award only
+        /// when `deadlineLeadSeconds` is nil. Nil when no other qualifying
+        /// account resets at effectively the same time.
         let atRiskGapUnits: Double?
+        /// How much earlier the badged account's window resets than the next
+        /// qualifying rival's (v5), in seconds. Non-nil means the deadline
+        /// decided the award outright and size never came into it; nil means
+        /// there was no later-resetting rival to lead.
+        let deadlineLeadSeconds: TimeInterval?
         /// Tooltip payload for the badged account.
         let badge: Badge
     }
@@ -342,15 +367,25 @@ enum BestAccount {
     /// window, issue #21 for weekly-scoped ones).
     ///
     /// Three strictly prioritized legs, never a numeric comparison between
-    /// them: the session leg first (the shorter clock — capacity expiring in
-    /// hours is more urgent than capacity expiring in days), then the weekly
-    /// leg, then the v2 behavior wholesale (most 5-hour-session headroom
-    /// wins, subject to the vetoes and the anti-flapping margin, with the
-    /// pace override possibly moving the badge to a runner-up projected to
-    /// outlast the winner). Session and weekly at-risk are measured in
-    /// percents of differently sized windows, and the API never exposes the
-    /// ratio between them, so any arithmetic across the two would be
-    /// meaningless — priority is the only honest combination.
+    /// them: the session leg first, then the weekly leg, then the v2 behavior
+    /// wholesale (most 5-hour-session headroom wins, subject to the vetoes and
+    /// the anti-flapping margin, with the pace override possibly moving the
+    /// badge to a runner-up projected to outlast the winner). Session and
+    /// weekly at-risk are measured in percents of differently sized windows,
+    /// and the API never exposes the ratio between them, so any arithmetic
+    /// across the two would be meaningless — priority is the only honest
+    /// combination.
+    ///
+    /// Through v4 the session leg's priority was justified as "the shorter
+    /// clock wins": capacity expiring in hours beats capacity expiring in
+    /// days. That confused urgency with scarcity. A session window is
+    /// throughput drawn from the weekly budget and reissued every few hours,
+    /// so letting one lapse normally costs nothing, while weekly quota unspent
+    /// at the weekly reset is gone for good — the shorter clock governs the
+    /// *less* scarce resource. v5 keeps the ordering but narrows the session
+    /// leg to the cases where a session window really is lost capacity, so it
+    /// no longer pre-empts the weekly leg on capacity that was never at stake;
+    /// `refillsBeforeWeeklyReset` is where that is decided.
     ///
     /// `weeklyBurnRates` is keyed by account id and then by limit id, since
     /// an account can have several weekly-scoped windows (`weekly_all`,
@@ -423,7 +458,8 @@ enum BestAccount {
                     quota: quotas[account.id], now: now)
             }
             attachAtRisk(
-                to: &candidates, aggregatePace: aggregatePace,
+                to: &candidates, windows: windowsByAccount,
+                aggregatePace: aggregatePace,
                 effectiveMultipliers: effectiveMultipliers, now: now)
             attachWeeklyAtRisk(
                 to: &candidates, windows: windowsByAccount,
@@ -521,6 +557,7 @@ enum BestAccount {
             sessionName: session?.name,
             sessionPercent: session?.percent,
             sessionResetsAt: session?.resetsAt,
+            sessionWindowSeconds: session?.windowSeconds,
             burnRate: burnRate,
             quota: quota,
             eligibility: eligibility,
@@ -540,9 +577,12 @@ enum BestAccount {
     /// is the *other* eligible accounts' combined session headroom in the
     /// same units — the capacity that could absorb the group's demand
     /// instead. The own-percent mirror is stored alongside for display.
+    ///
+    /// A session window that lapses is usually not a loss at all (v5), which
+    /// `sessionRefills` decides — see `refillsBeforeWeeklyReset`.
     private static func attachAtRisk(
-        to candidates: inout [CandidateTrace], aggregatePace: Double,
-        effectiveMultipliers: [String: Double], now: Date
+        to candidates: inout [CandidateTrace], windows: [String: [LimitStatus]],
+        aggregatePace: Double, effectiveMultipliers: [String: Double], now: Date
     ) {
         let eligible: [(index: Int, headroomUnits: Double)] = candidates.indices.compactMap {
             index in
@@ -555,15 +595,74 @@ enum BestAccount {
         let totalHeadroom = eligible.reduce(0.0) { $0 + $1.headroomUnits }
         for (index, headroomUnits) in eligible {
             let multiplier = effectiveMultipliers[candidates[index].accountID] ?? 1
-            let units = atRiskCapacity(
-                headroom: headroomUnits,
-                resetsAt: candidates[index].sessionResetsAt,
-                aggregatePace: aggregatePace,
-                coverage: totalHeadroom - headroomUnits,
-                now: now)
+            let refills = refillsBeforeWeeklyReset(
+                sessionResetsAt: candidates[index].sessionResetsAt,
+                sessionWindowSeconds: candidates[index].sessionWindowSeconds,
+                weeklyWindows: windows[candidates[index].accountID] ?? [])
+            let units =
+                refills
+                ? 0
+                : atRiskCapacity(
+                    headroom: headroomUnits,
+                    resetsAt: candidates[index].sessionResetsAt,
+                    aggregatePace: aggregatePace,
+                    coverage: totalHeadroom - headroomUnits,
+                    now: now)
+            candidates[index].sessionRefills = refills
             candidates[index].atRiskUnits = units
             candidates[index].atRiskPercent = units * 100 / multiplier
         }
+    }
+
+    /// Whether a whole fresh session window opens before this account's
+    /// earliest weekly reset — in which case the current session window
+    /// expiring costs nothing and must not win the session leg (v5).
+    ///
+    /// The session leg was written as if an expiring session window were lost
+    /// capacity. It generally isn't: **a session window is throughput, not
+    /// stock.** Its allowance is drawn from the weekly budget and replaced
+    /// every `windowSeconds`, so declining to spend one leaves the quota
+    /// untouched and spendable in the next. The only capacity that truly
+    /// vanishes is weekly quota unspent at the weekly reset — which is the
+    /// weekly leg's business.
+    ///
+    /// So an expiring session window is a real loss in exactly one shape the
+    /// clock can see: when the weekly reset lands so soon after it that the
+    /// replacement window is cut short, making this one the last full chance
+    /// to spend that week's remainder. Concretely — session resetting at `S`
+    /// with length `L`, earliest weekly reset at `W` — the successor window
+    /// runs `[S, S+L]` and only fits when `W > S + L`.
+    ///
+    /// Deliberate consequences:
+    ///
+    /// - The session leg now fires rarely: only in the run-up to a weekly
+    ///   reset, or for an account with no weekly window at all (nothing
+    ///   bounds its sessions, so every one of them is throughput that is
+    ///   genuinely gone). That is the point — before v5 the leg claimed the
+    ///   verdict on capacity that was never scarce, and because it is tried
+    ///   first it did so ahead of the weekly leg's real losses.
+    /// - The mirror case is not modelled: an account can also be
+    ///   session-*throughput*-bound, holding more weekly headroom than the
+    ///   remaining session windows before `W` can physically deliver, and
+    ///   then every window really does matter. Detecting it needs the ratio
+    ///   between a session window's allowance and a week's, which the API
+    ///   never states. Erring this way keeps the leg quiet instead of letting
+    ///   it speak on a guess.
+    private static func refillsBeforeWeeklyReset(
+        sessionResetsAt: Date?, sessionWindowSeconds: TimeInterval?,
+        weeklyWindows: [LimitStatus]
+    ) -> Bool {
+        guard let sessionResetsAt else { return false }
+        // No stated length: assume the standard five-hour window rather than
+        // give up on the gate, since the successor's length is the whole
+        // question and every provider seen so far uses it.
+        let length = sessionWindowSeconds ?? 5 * 3600
+        // No weekly window bounds this account: sessions are the only budget
+        // it has, so a lapsed one is capacity that never comes back.
+        guard let earliestWeeklyReset = weeklyWindows.compactMap(\.resetsAt).min() else {
+            return false
+        }
+        return earliestWeeklyReset > sessionResetsAt.addingTimeInterval(length)
     }
 
     /// The weekly-leg mirror of `attachAtRisk` (issue #21): the same
@@ -708,9 +807,12 @@ enum BestAccount {
     /// leg's fallback reason preserved for the debug view.
     ///
     /// The legs are strictly ordered, never numerically compared: the session
-    /// leg is tried first because it is the shorter clock (capacity expiring
-    /// in hours beats capacity expiring in days), and a leg is consulted only
-    /// when every leg before it stood down.
+    /// leg is tried first because it speaks to the nearer deadline, and a leg
+    /// is consulted only when every leg before it stood down. What keeps that
+    /// ordering honest is that the session leg now stands down whenever the
+    /// window it is looking at simply refills (v5, see `attachAtRisk`) — so it
+    /// pre-empts the weekly leg only when a session window really is the last
+    /// chance to spend the week.
     private static func decision(
         for candidates: [CandidateTrace], groupSize: Int,
         aggregatePace: Double, weeklyAggregatePace: Double
@@ -801,6 +903,20 @@ enum BestAccount {
     /// One expiring-capacity leg's verdict over its own units: either an
     /// award, or the reason the leg stood down. Exactly one of the two is
     /// non-nil. `entries` arrive in headroom order, which ties fall back to.
+    ///
+    /// **Size qualifies; the clock ranks** (v5). Through v4 the leader was
+    /// simply whoever had the most at risk, and `resetsAt` was read only to
+    /// fill in the tooltip — so an account with more capacity expiring days
+    /// from now outranked one with slightly less expiring tonight, and the
+    /// badge said "use it before its reset" about the window resetting last.
+    /// The nearer deadline wins instead: a larger pile behind a later reset is
+    /// still there to be worked through once the closer one has passed, and
+    /// the reverse is not true. `floor` still decides which entries are worth
+    /// acting on at all, and size only settles rivals whose resets land within
+    /// `deadlineMargin` of each other.
+    ///
+    /// Ranking on a fixed timestamp rather than a refitted estimate also makes
+    /// the verdict steadier between polls than the size ordering it replaces.
     private static func expiringVerdict(
         entries: [RiskEntry], pace: Double, floor: Double, margin: Double,
         leg: ExpiringAward.Leg
@@ -808,35 +924,52 @@ enum BestAccount {
         guard pace > 0 else { return (nil, .noAggregatePace) }
         guard !entries.isEmpty else { return (nil, .belowFloor(topAtRiskUnits: 0)) }
 
-        // Largest at-risk first; ties keep the headroom order.
-        let byRisk = entries.sorted { $0.units > $1.units }
-        let leader = byRisk[0]
-        let runnerUpRisk = byRisk.count >= 2 ? byRisk[1].units : nil
-        if leader.units < floor {
-            return (nil, .belowFloor(topAtRiskUnits: leader.units))
+        // Only entries with a meaningful amount expiring get a say. A missing
+        // reset can't be ranked on a deadline and is unreachable anyway —
+        // positive at-risk implies a live future reset.
+        let qualified = entries.filter { $0.units >= floor && $0.resetsAt != nil }
+        guard !qualified.isEmpty else {
+            return (nil, .belowFloor(topAtRiskUnits: entries.map(\.units).max() ?? 0))
         }
-        if let runnerUpRisk, leader.units - runnerUpRisk < margin {
-            return (
-                nil,
-                .atRiskTooClose(
-                    leaderID: leader.accountID, runnerUpID: byRisk[1].accountID,
-                    gapUnits: leader.units - runnerUpRisk)
-            )
+
+        // The earliest deadline, and everyone effectively sharing it.
+        let earliest = qualified.compactMap(\.resetsAt).min()!
+        let deadline = earliest.addingTimeInterval(deadlineMargin)
+        let contenders = qualified
+            .filter { $0.resetsAt! <= deadline }
+            .sorted { $0.units > $1.units }
+        let leader = contenders[0]
+
+        // Same-deadline rivals are separated on size, under the leg's own
+        // anti-flap margin — the v4 comparison, now scoped to the only case
+        // where the clock has nothing to say.
+        if contenders.count >= 2 {
+            let gap = leader.units - contenders[1].units
+            if gap < margin {
+                return (
+                    nil,
+                    .atRiskTooClose(
+                        leaderID: leader.accountID, runnerUpID: contenders[1].accountID,
+                        gapUnits: gap)
+                )
+            }
         }
-        guard let resetsAt = leader.resetsAt else {
-            // Unreachable: positive at-risk implies a live future reset.
-            return (nil, .belowFloor(topAtRiskUnits: leader.units))
-        }
+
+        let nextDeadline = qualified.compactMap(\.resetsAt).filter { $0 > deadline }.min()
         return (
             ExpiringAward(
                 leg: leg,
                 badgedID: leader.accountID,
                 atRiskUnits: leader.units,
-                atRiskGapUnits: runnerUpRisk.map { leader.units - $0 },
+                atRiskGapUnits: contenders.count >= 2
+                    ? leader.units - contenders[1].units : nil,
+                deadlineLeadSeconds: nextDeadline.map {
+                    $0.timeIntervalSince(leader.resetsAt!)
+                },
                 badge: Badge(
                     expiring: ExpiringCapacity(
                         // The tooltip speaks the account's own percent.
-                        points: leader.percent, resetsAt: resetsAt,
+                        points: leader.percent, resetsAt: leader.resetsAt!,
                         scopeName: leader.scopeName))),
             nil
         )
