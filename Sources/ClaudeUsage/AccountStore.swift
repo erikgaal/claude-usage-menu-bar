@@ -280,15 +280,25 @@ final class AccountStore: ObservableObject {
     }
 
     /// Moves an account up (negative offset) or down (positive) in the list.
-    /// Array order is the single source of truth — it drives the panel, the
-    /// menu bar summary, and the persisted JSON — so this is the whole change.
     func moveAccount(_ account: AccountMeta, by offset: Int) {
         guard let index = accounts.firstIndex(where: { $0.id == account.id }) else { return }
-        let destination = index + offset
-        guard accounts.indices.contains(destination), destination != index else { return }
+        moveAccount(id: account.id, to: index + offset)
+    }
+
+    /// Moves the account with this id to `destination`, i.e. that becomes its
+    /// new index. Array order is the single source of truth — it drives the
+    /// panel, the menu bar summary, and the persisted JSON — so this is the
+    /// whole change. Answers whether anything moved, which is also the drag's
+    /// "was this drop accepted?" (unknown ids — foreign drags — say no).
+    @discardableResult
+    func moveAccount(id: String, to destination: Int) -> Bool {
+        guard let index = accounts.firstIndex(where: { $0.id == id }),
+            accounts.indices.contains(destination), destination != index
+        else { return false }
         let moved = accounts.remove(at: index)
         accounts.insert(moved, at: destination)
         persistAccounts()
+        return true
     }
 
     func removeAccount(_ account: AccountMeta) {

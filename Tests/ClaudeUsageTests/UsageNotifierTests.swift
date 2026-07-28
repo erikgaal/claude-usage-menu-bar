@@ -377,7 +377,7 @@ final class UsageNotifierTests: XCTestCase {
     func testSwitchSuggestionsRequireTheMasterToggle() {
         let (notifier, spy) = makeNotifier(enabled: false)
         let (accounts, badges) = switchFixture()
-        XCTAssertTrue(notifier.suggestsSwitches)
+        XCTAssertTrue(notifier.isEnabled(.switchSuggestion))
 
         notifier.groupsDidUpdate(
             accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24])
@@ -387,7 +387,7 @@ final class UsageNotifierTests: XCTestCase {
     func testSwitchSuggestionsToggleSilencesThemImmediately() {
         let (notifier, spy) = makeNotifier()
         let (accounts, badges) = switchFixture()
-        notifier.suggestsSwitches = false
+        notifier.setEnabled(false, for: .switchSuggestion)
 
         notifier.groupsDidUpdate(
             accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24])
@@ -413,8 +413,8 @@ final class UsageNotifierTests: XCTestCase {
 
         // Off and on again: the memory is cleared, so the current
         // recommendation is delivered rather than swallowed by a stale edge.
-        notifier.suggestsSwitches = false
-        notifier.suggestsSwitches = true
+        notifier.setEnabled(false, for: .switchSuggestion)
+        notifier.setEnabled(true, for: .switchSuggestion)
         notifier.groupsDidUpdate(
             accounts: accounts, badges: badges, sessionBurnRates: ["acct-a": 24],
             now: now.addingTimeInterval(60))
@@ -424,14 +424,140 @@ final class UsageNotifierTests: XCTestCase {
     func testSuggestionsSettingDefaultsOnAndPersistsIndependently() {
         let defaults = makeDefaults()
         let first = UsageNotifier(scheduler: SchedulerSpy(), defaults: defaults)
-        XCTAssertTrue(first.suggestsSwitches)
-        first.suggestsSwitches = false
+        XCTAssertTrue(first.isEnabled(.switchSuggestion))
+        first.setEnabled(false, for: .switchSuggestion)
 
         // Relaunch: the opt-out survives, and it is its own key — the master
         // toggle is untouched.
         let second = UsageNotifier(scheduler: SchedulerSpy(), defaults: defaults)
-        XCTAssertFalse(second.suggestsSwitches)
+        XCTAssertFalse(second.isEnabled(.switchSuggestion))
         XCTAssertFalse(second.isEnabled)
+    }
+
+    // MARK: Per-kind switches
+
+    func testEveryKindIsOnByDefault() {
+        let (notifier, _) = makeNotifier()
+        for kind in NotificationKind.allCases {
+            XCTAssertTrue(notifier.isEnabled(kind), "\(kind) should default to on")
+        }
+    }
+
+    func testDisablingThresholdKindKeepsOtherKindsFiring() {
+        let (notifier, spy) = makeNotifier()
+        notifier.setEnabled(false, for: .limitThreshold)
+
+        // Same update carries all three events: a threshold crossing, a hot
+        // limit worth a reset alert, and a fresh sign-in failure.
+        notifier.accountDidUpdate(
+            makeAccount(),
+            old: makeState([makeLimit(percent: 85)]),
+            new: makeState(
+                [makeLimit(percent: 95, resetsAt: Self.resetDate)], needsReauth: true))
+
+        XCTAssertEqual(spy.posted.count, 1)
+        XCTAssertTrue(spy.posted[0].body.contains("Sign-in expired"))
+        XCTAssertEqual(spy.scheduled.count, 1)
+    }
+
+    func testDisablingSignInKindKeepsThresholdAlerts() {
+        let (notifier, spy) = makeNotifier()
+        notifier.setEnabled(false, for: .signInExpired)
+
+        notifier.accountDidUpdate(
+            makeAccount(),
+            old: makeState([makeLimit(percent: 85)]),
+            new: makeState([makeLimit(percent: 95)], needsReauth: true))
+
+        XCTAssertEqual(spy.posted.count, 1)
+        XCTAssertEqual(spy.posted[0].body, "Session limit at 95%")
+    }
+
+    func testDisablingResetKindSchedulesNothingAndKeepsThresholdAlerts() {
+        let (notifier, spy) = makeNotifier()
+        notifier.setEnabled(false, for: .limitReset)
+
+        notifier.accountDidUpdate(
+            makeAccount(),
+            old: makeState([makeLimit(percent: 85)]),
+            new: makeState([makeLimit(percent: 95, resetsAt: Self.resetDate)]))
+
+        XCTAssertTrue(spy.scheduled.isEmpty)
+        XCTAssertEqual(spy.posted.count, 1)
+    }
+
+    func testDisablingResetKindCancelsAlreadyQueuedAlerts() {
+        let (notifier, spy) = makeNotifier()
+        notifier.accountDidUpdate(
+            makeAccount(),
+            old: makeState([makeLimit(percent: 92)]),
+            new: makeState([makeLimit(percent: 92, resetsAt: Self.resetDate)]))
+        XCTAssertEqual(spy.pending.count, 1)
+
+        notifier.setEnabled(false, for: .limitReset)
+
+        XCTAssertEqual(spy.removedIdentifiers, [Self.resetID])
+        XCTAssertTrue(spy.pending.isEmpty)
+        // The master switch stays on, so this is not a removeAll.
+        XCTAssertEqual(spy.removeAllCount, 0)
+        XCTAssertTrue(notifier.isEnabled)
+    }
+
+    func testReEnablingResetKindReschedulesOnTheNextUpdate() {
+        let (notifier, spy) = makeNotifier()
+        let hot = makeState([makeLimit(percent: 92, resetsAt: Self.resetDate)])
+        notifier.setEnabled(false, for: .limitReset)
+        notifier.accountDidUpdate(makeAccount(), old: hot, new: hot)
+        XCTAssertTrue(spy.scheduled.isEmpty)
+
+        notifier.setEnabled(true, for: .limitReset)
+        notifier.accountDidUpdate(makeAccount(), old: hot, new: hot)
+
+        XCTAssertEqual(Array(spy.pending.keys), [Self.resetID])
+    }
+
+    func testKindChoicesPersistAcrossRelaunch() {
+        let defaults = makeDefaults()
+        let first = UsageNotifier(scheduler: SchedulerSpy(), defaults: defaults)
+        first.isEnabled = true
+        first.setEnabled(false, for: .limitReset)
+
+        let second = UsageNotifier(scheduler: SchedulerSpy(), defaults: defaults)
+        XCTAssertFalse(second.isEnabled(.limitReset))
+        XCTAssertTrue(second.isEnabled(.limitThreshold))
+        XCTAssertTrue(second.isEnabled(.signInExpired))
+    }
+
+    /// Upgrade path: an install that enabled notifications before per-kind
+    /// switches existed has no per-kind keys, and must keep getting all three.
+    func testInstallWithNoStoredKindKeysGetsEverything() {
+        let defaults = makeDefaults()
+        defaults.set(true, forKey: "notificationsEnabled")
+        let spy = SchedulerSpy()
+        let notifier = UsageNotifier(scheduler: spy, defaults: defaults)
+
+        XCTAssertTrue(notifier.isEnabled)
+        notifier.accountDidUpdate(
+            makeAccount(),
+            old: makeState([makeLimit(percent: 85)]),
+            new: makeState(
+                [makeLimit(percent: 95, resetsAt: Self.resetDate)], needsReauth: true))
+
+        XCTAssertEqual(spy.posted.count, 2)  // threshold + sign-in
+        XCTAssertEqual(spy.scheduled.count, 1)  // reset
+    }
+
+    func testMasterSwitchOffSilencesEnabledKinds() {
+        let (notifier, spy) = makeNotifier(enabled: false)
+        XCTAssertTrue(notifier.isEnabled(.limitThreshold))
+
+        notifier.accountDidUpdate(
+            makeAccount(),
+            old: makeState([makeLimit(percent: 85)]),
+            new: makeState([makeLimit(percent: 95, resetsAt: Self.resetDate)]))
+
+        XCTAssertTrue(spy.posted.isEmpty)
+        XCTAssertTrue(spy.scheduled.isEmpty)
     }
 
     func testEnabledStatePersistsWithoutReprompting() {

@@ -18,21 +18,10 @@ struct MenuContentView: View {
                 }
             }
 
-            if store.isAddingAccount {
-                addAccountBanner
-                Divider()
-            }
-            if let error = store.addAccountError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                Divider()
-            }
+            // Sign-in feedback belongs here too: an expired account's "Sign in
+            // again" button starts the same flow from this panel.
+            AddAccountStatus(store: store)
 
-            addButtons
-            Divider()
             footer
         }
         .frame(width: 340)
@@ -69,56 +58,24 @@ struct MenuContentView: View {
             Text("No accounts yet")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            Text("Add each subscription you want to track.")
+            Text("Add each subscription you want to track in Settings.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
+            OpenSettingsButton {
+                Label("Add an account…", systemImage: "plus")
+            }
+            .buttonStyle(.link)
+            .padding(.top, 2)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
     }
 
-    private var addAccountBanner: some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.small)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(
-                    "Waiting for \(store.pendingProvider?.displayName ?? "") sign-in in your browser…"
-                )
-                .font(.caption)
-                Text("For a second account, use a private window or log out first.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button("Cancel") { store.cancelAddAccount() }
-                .controlSize(.small)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-    }
-
     // MARK: Footer
 
-    private var addButtons: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ForEach(ProviderID.allCases, id: \.self) { providerID in
-                Button {
-                    store.beginAddAccount(provider: providerID)
-                } label: {
-                    Label(
-                        "Add \(providerID.displayName) account",
-                        systemImage: "plus.app")
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.primary)
-                .disabled(store.isAddingAccount)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-    }
-
+    /// The panel's own controls only: news (an available update), the way into
+    /// Settings, and Quit. Everything configurable lives in the settings
+    /// window (see `SettingsView`).
     private var footer: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let release = updateChecker.availableRelease {
@@ -134,14 +91,12 @@ struct MenuContentView: View {
                 .help("Open the release page")
             }
             HStack {
-                Text("Launch at login")
-                Spacer()
-                Toggle("", isOn: launchAtLoginBinding)
-                    .labelsHidden()
-                    .toggleStyle(.checkbox)
-            }
-            NotificationsToggleRow(notifier: store.notifier)
-            HStack {
+                OpenSettingsButton {
+                    Label("Settings…", systemImage: "gearshape")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.primary)
+                .keyboardShortcut(",", modifiers: .command)
                 Spacer()
                 Button("Quit") {
                     NSApplication.shared.terminate(nil)
@@ -154,51 +109,23 @@ struct MenuContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
     }
-
-    private var launchAtLoginBinding: Binding<Bool> {
-        Binding(
-            get: { store.launchAtLogin },
-            set: { store.setLaunchAtLogin($0) }
-        )
-    }
 }
 
-/// Own view observing the notifier directly — AccountStore doesn't republish
-/// its nested ObservableObject, so binding through `store` would leave the
-/// checkbox stale. Toggling drives authorization/cancellation via the
-/// notifier's own didSet.
-private struct NotificationsToggleRow: View {
-    @ObservedObject var notifier: UsageNotifier
+/// Opens the settings window, with the activation an accessory app needs:
+/// with no Dock icon the app isn't frontmost while the panel is open, so the
+/// window would otherwise appear behind whatever is. Activating on both sides
+/// of the open covers either ordering AppKit picks.
+struct OpenSettingsButton<Label: View>: View {
+    @Environment(\.openSettings) private var openSettings
+    @ViewBuilder let label: () -> Label
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("Enable notifications")
-                Spacer()
-                Toggle("", isOn: $notifier.isEnabled)
-                    .labelsHidden()
-                    .toggleStyle(.checkbox)
-            }
-            .help(
-                "Alerts when a limit passes \(Int(UsageNotifier.thresholdPercent))%, "
-                    + "when it resets, and when sign-in expires")
-
-            // Advisory half of the feature (issue #24), indented under its
-            // master switch and inert while that switch is off — limit alerts
-            // are urgent, switch advice is not.
-            HStack {
-                Text("Suggest account switches")
-                Spacer()
-                Toggle("", isOn: $notifier.suggestsSwitches)
-                    .labelsHidden()
-                    .toggleStyle(.checkbox)
-            }
-            .padding(.leading, 14)
-            .foregroundStyle(notifier.isEnabled ? .primary : .tertiary)
-            .disabled(!notifier.isEnabled)
-            .help(
-                "Tells you when another account of the same provider is the "
-                    + "better one to be using right now")
+        Button {
+            NSApp.activate(ignoringOtherApps: true)
+            openSettings()
+            NSApp.activate(ignoringOtherApps: true)
+        } label: {
+            label()
         }
     }
 }
@@ -209,10 +136,7 @@ struct AccountSection: View {
     @ObservedObject var store: AccountStore
     let account: AccountMeta
 
-    @State private var isRenaming = false
-    @State private var draftName = ""
     @State private var showsBestDetails = false
-    @FocusState private var renameFocused: Bool
 
     private var state: AccountDisplayState {
         store.states[account.id] ?? AccountDisplayState()
@@ -222,46 +146,6 @@ struct AccountSection: View {
     /// the best-account hint (and its debug breakdown) means anything.
     private var hasProviderPeers: Bool {
         store.accounts.filter { $0.provider == account.provider }.count >= 2
-    }
-
-    /// The account's plan multiplier, read live from the store (the section
-    /// holds an immutable `account` snapshot) and written through it.
-    private var quotaMultiplierBinding: Binding<Double?> {
-        Binding(
-            get: {
-                store.accounts.first { $0.id == account.id }?.quotaMultiplier
-            },
-            set: { store.setQuotaMultiplier(account, to: $0) }
-        )
-    }
-
-    private var storedAccount: AccountMeta? {
-        store.accounts.first { $0.id == account.id }
-    }
-
-    /// Label for the picker's nil (no manual override) entry: the weight
-    /// detection settled on, or a plain statement that it didn't.
-    private var autoWeightLabel: String {
-        guard let detected = storedAccount?.detectedQuotaMultiplier else {
-            return "Auto — not detected"
-        }
-        return "Auto — \(Self.planName(for: detected)) (detected)"
-    }
-
-    /// The raw `rate_limit_tier` the API reported, for the informational row.
-    private var detectedTierText: String {
-        storedAccount?.detectedRateLimitTier ?? "none"
-    }
-
-    /// Plan-name hint for a weight — a hint, not a definition: several
-    /// subscriptions can share one weight (e.g. Max 5× and a Team seat).
-    static func planName(for multiplier: Double) -> String {
-        switch multiplier {
-        case 1: return "Pro (×1)"
-        case 5: return "Max 5× (×5)"
-        case 20: return "Max 20× (×20)"
-        default: return "×\(Int(multiplier))"
-        }
     }
 
     var body: some View {
@@ -303,72 +187,21 @@ struct AccountSection: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .contentShape(Rectangle())
+        // Inspection only — naming, weighting, reordering and removing an
+        // account all live in the settings window now.
         .contextMenu {
-            Button("Rename…") { startRenaming() }
-            // The weight scales this account's window against the others
-            // when pooling burn rates behind the "Best" badge. Asking for a
-            // relative weight rather than a plan name keeps the user out of
-            // "is my Team premium seat a Max 5×?" territory: only the ratio
-            // between their own accounts matters. Claude only — Codex tier
-            // ratios aren't known, so those accounts stay unweighted.
-            if account.provider == .claude {
-                Picker("Quota weight", selection: quotaMultiplierBinding) {
-                    // No manual override: the detected weight, or none.
-                    Text(autoWeightLabel).tag(Optional<Double>.none)
-                    Text("×1 — Pro").tag(Optional(1.0))
-                    Text("×5 — Max 5× or Team seat").tag(Optional(5.0))
-                    Text("×20 — Max 20×").tag(Optional(20.0))
-                    Divider()
-                    // Non-interactive: shows exactly what the server said,
-                    // so an unrecognized plan can still be weighted knowingly.
-                    Text("API reports: \(detectedTierText)")
-                }
-                .help(
-                    "How big this account's session window is relative to your "
-                        + "others (one full Pro window = ×1). Used to pool burn "
-                        + "rates across differently-sized subscriptions — getting "
-                        + "the ratio between your accounts right is what matters, "
-                        + "not identifying the plan exactly.")
-            }
             if hasProviderPeers {
                 Button("Best-account details…") { showsBestDetails = true }
             }
-            Divider()
-            // Order matters beyond the panel: it also sets the menu bar
-            // summary order, so surface reordering right where accounts live.
-            Button("Move Up") { store.moveAccount(account, by: -1) }
-                .disabled(store.accounts.first?.id == account.id)
-            Button("Move Down") { store.moveAccount(account, by: 1) }
-                .disabled(store.accounts.last?.id == account.id)
-            Divider()
-            Button("Remove Account", role: .destructive) {
-                store.removeAccount(account)
-            }
+            OpenSettingsButton { Text("Account Settings…") }
         }
     }
 
     private var titleRow: some View {
         HStack(spacing: 8) {
             ProviderBadge(provider: account.provider)
-            if isRenaming {
-                TextField(
-                    "Name", text: $draftName,
-                    onCommit: {
-                        store.rename(account, to: draftName)
-                        isRenaming = false
-                    }
-                )
-                .textFieldStyle(.roundedBorder)
-                .controlSize(.small)
-                .frame(width: 130)
-                .focused($renameFocused)
-                .onExitCommand { isRenaming = false }
-            } else {
-                Text(account.displayLabel)
-                    .font(.system(size: 14, weight: .bold))
-                    .onTapGesture(count: 2) { startRenaming() }
-                    .help("Double-click to rename")
-            }
+            Text(account.displayLabel)
+                .font(.system(size: 14, weight: .bold))
             Text(account.email)
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -385,12 +218,6 @@ struct AccountSection: View {
                 BestAccountDebugView(trace: trace)
             }
         }
-    }
-
-    private func startRenaming() {
-        draftName = account.label ?? ""
-        isRenaming = true
-        renameFocused = true
     }
 
     // MARK: Limits with grouped reset lines

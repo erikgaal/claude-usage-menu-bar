@@ -18,7 +18,8 @@ enum Mock {
     static let accounts: [AccountMeta] = [
         AccountMeta(
             id: "mock-work", email: "work@example.com", organizationName: nil,
-            provider: .claude, label: "Work"),
+            provider: .claude, label: "Work",
+            detectedRateLimitTier: "default_claude_max_5x", detectedQuotaMultiplier: 5),
         AccountMeta(
             id: "mock-personal", email: "personal@example.com", organizationName: nil,
             provider: .claude, label: "Personal"),

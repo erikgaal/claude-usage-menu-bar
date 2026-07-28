@@ -79,6 +79,66 @@ final class SystemNotificationScheduler: NotificationScheduling {
     }
 }
 
+// MARK: - Kinds
+
+/// The distinct things the app notifies about, each switchable on its own
+/// underneath the master toggle (see `UsageNotifier.isEnabled`).
+enum NotificationKind: String, CaseIterable, Identifiable {
+    /// A limit crossing the usage threshold.
+    case limitThreshold
+    /// A limit that had crossed the threshold reaching its reset.
+    case limitReset
+    /// An account's stored sign-in dying.
+    case signInExpired
+    /// Another account of the same provider being the better one to use
+    /// (see `SwitchSuggestion`) — advice rather than an alarm.
+    case switchSuggestion
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .limitThreshold:
+            return "Limit reaches \(Int(UsageNotifier.thresholdPercent))%"
+        case .limitReset: return "Limit resets"
+        case .signInExpired: return "Sign-in expires"
+        case .switchSuggestion: return "Suggest account switches"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .limitThreshold:
+            return "Alerts once each time a limit crosses "
+                + "\(Int(UsageNotifier.thresholdPercent))%, not on every poll while it "
+                + "stays there."
+        case .limitReset:
+            return "Alerts when a limit that had crossed "
+                + "\(Int(UsageNotifier.thresholdPercent))% resets and is usable again. "
+                + "Scheduled ahead of time, so switching this on takes effect from the "
+                + "next poll."
+        case .signInExpired:
+            return "Alerts when an account's stored sign-in stops working and needs "
+                + "signing in again."
+        case .switchSuggestion:
+            return "Tells you when another account of the same provider is the better "
+                + "one to be using right now. Advice, not an alarm — the only kind you "
+                + "might want off while the urgent ones stay on."
+        }
+    }
+
+    /// UserDefaults key. An absent key reads as on, so an existing install
+    /// keeps every alert it was already getting.
+    var defaultsKey: String {
+        switch self {
+        // The key this switch shipped under before the kinds were unified;
+        // keeping it means an existing opt-out survives the change.
+        case .switchSuggestion: return "switchSuggestionsEnabled"
+        case .limitThreshold, .limitReset, .signInExpired: return "notify.\(rawValue)"
+        }
+    }
+}
+
 // MARK: - Notifier
 
 /// Local-notification manager: alerts when a limit crosses the usage
@@ -92,10 +152,10 @@ final class SystemNotificationScheduler: NotificationScheduling {
 final class UsageNotifier: ObservableObject {
     /// Alert when a limit reaches this percent. Fixed for v1; making it
     /// user-configurable only needs a settings control, not new diff logic.
-    static let thresholdPercent: Double = 90
+    /// Nonisolated so `NotificationKind`'s labels can name it.
+    nonisolated static let thresholdPercent: Double = 90
 
     private static let defaultsKey = "notificationsEnabled"
-    private static let switchSuggestionsKey = "switchSuggestionsEnabled"
 
     private let scheduler: NotificationScheduling
     private let defaults: UserDefaults
@@ -105,9 +165,9 @@ final class UsageNotifier: ObservableObject {
     /// reasoning and the relaunch consequence.
     private var switchState: [ProviderID: SwitchSuggestion.GroupState] = [:]
 
-    /// User toggle from the panel footer. Enabling requests system
-    /// authorization (the OS only prompts the first time); disabling drops
-    /// any scheduled reset alerts so nothing fires while off.
+    /// Master switch from settings. Enabling requests system authorization
+    /// (the OS only prompts the first time); disabling drops any scheduled
+    /// reset alerts so nothing fires while off.
     @Published var isEnabled: Bool {
         didSet {
             guard oldValue != isEnabled else { return }
@@ -125,21 +185,11 @@ final class UsageNotifier: ObservableObject {
         }
     }
 
-    /// The advisory half of the feature: "Suggest account switches" in the
-    /// panel footer, gated by `isEnabled` (limit alerts are urgent, switch
-    /// advice is not, and the issue expects one without the other to be
-    /// possible). Defaults to on, so enabling notifications delivers the whole
-    /// feature; opting out is one click and is remembered under its own key.
-    /// Toggling clears the notification memory, so switching it off stops
-    /// suggestions on the very next cycle and switching it on doesn't inherit
-    /// a stale edge.
-    @Published var suggestsSwitches: Bool {
-        didSet {
-            guard oldValue != suggestsSwitches else { return }
-            defaults.set(suggestsSwitches, forKey: Self.switchSuggestionsKey)
-            switchState.removeAll()
-        }
-    }
+    /// Which kinds are switched on, within what the master switch allows.
+    /// `.switchSuggestion` is the advisory one — limit alerts are urgent,
+    /// switch advice is not, and issue #24 expects one without the other to be
+    /// possible, which every kind having its own switch now delivers.
+    @Published private(set) var enabledKinds: Set<NotificationKind> = []
 
     /// Production configuration. A separate overload because a default
     /// argument of `SystemNotificationScheduler()` would be evaluated in a
@@ -156,11 +206,37 @@ final class UsageNotifier: ObservableObject {
         // Assigning in init doesn't trip didSet, so restoring the saved value
         // never re-prompts for authorization at launch.
         isEnabled = defaults.bool(forKey: Self.defaultsKey)
-        // Absent key → on: `bool(forKey:)` alone would default the advisory
-        // alerts off and leave the feature invisible to anyone who never opens
-        // the footer.
-        suggestsSwitches =
-            defaults.object(forKey: Self.switchSuggestionsKey) as? Bool ?? true
+        // Absent key → on: `bool(forKey:)` alone would default every kind off
+        // and leave the alerts invisible to anyone who never opens settings.
+        enabledKinds = Set(
+            NotificationKind.allCases.filter {
+                defaults.object(forKey: $0.defaultsKey) == nil
+                    || defaults.bool(forKey: $0.defaultsKey)
+            })
+    }
+
+    // MARK: - Per-kind switches
+
+    func isEnabled(_ kind: NotificationKind) -> Bool { enabledKinds.contains(kind) }
+
+    /// Switches one kind on or off, persisted. Reset alerts are the only kind
+    /// scheduled ahead of time, so switching that one off drops what's already
+    /// queued instead of leaving it to fire; switching it back on picks up at
+    /// the next poll's reconciliation.
+    func setEnabled(_ enabled: Bool, for kind: NotificationKind) {
+        guard isEnabled(kind) != enabled else { return }
+        if enabled {
+            enabledKinds.insert(kind)
+        } else {
+            enabledKinds.remove(kind)
+        }
+        defaults.set(enabled, forKey: kind.defaultsKey)
+        if kind == .limitReset && !enabled { removePendingResetAlerts() }
+        // Either direction forgets what we suggested: the advice only means
+        // something next to the situation it described, so switching it off
+        // stops suggestions on the next cycle and switching it on doesn't
+        // inherit a stale edge.
+        if kind == .switchSuggestion { switchState.removeAll() }
     }
 
     // MARK: - Event detection
@@ -174,7 +250,7 @@ final class UsageNotifier: ObservableObject {
 
         // Sign-in expired: only on the false→true flip, not on every poll
         // that keeps failing while the account waits for the user.
-        if new.needsReauth, old?.needsReauth != true {
+        if isEnabled(.signInExpired), new.needsReauth, old?.needsReauth != true {
             post(
                 title: account.displayLabel,
                 body: "Sign-in expired — open the menu to sign in again.")
@@ -188,7 +264,7 @@ final class UsageNotifier: ObservableObject {
         let previousPercent = Dictionary(
             (old?.limits ?? []).map { ($0.id, $0.percent) },
             uniquingKeysWith: { first, _ in first })
-        for limit in new.limits {
+        for limit in new.limits where isEnabled(.limitThreshold) {
             guard let previous = previousPercent[limit.id],
                 previous < Self.thresholdPercent,
                 limit.percent >= Self.thresholdPercent
@@ -218,7 +294,7 @@ final class UsageNotifier: ObservableObject {
         sessionBurnRates: [String: Double],
         now: Date = Date()
     ) {
-        guard isEnabled, suggestsSwitches else { return }
+        guard isEnabled, isEnabled(.switchSuggestion) else { return }
         let outcome = SwitchSuggestion.evaluate(
             accounts: accounts, badges: badges, sessionBurnRates: sessionBurnRates,
             state: switchState, now: now)
@@ -252,20 +328,23 @@ final class UsageNotifier: ObservableObject {
     /// window is a no-op (same id already pending) while a shifted window
     /// cancels the stale request and schedules the new time instead of
     /// stacking a second alert. Limits that dropped back below the threshold
-    /// lose their pending alert the same way.
+    /// lose their pending alert the same way — as does every limit while the
+    /// reset kind is switched off, since nothing is then desired.
     private func rescheduleResetAlerts(for account: AccountMeta, limits: [LimitStatus]) {
         var desired: [String: LimitStatus] = [:]
-        for limit in limits {
-            guard limit.percent >= Self.thresholdPercent,
-                let resetsAt = limit.resetsAt, resetsAt.timeIntervalSinceNow > 1
-            else { continue }
-            desired[Self.resetIdentifier(account: account, limit: limit, resetsAt: resetsAt)] =
-                limit
+        if isEnabled(.limitReset) {
+            for limit in limits {
+                guard limit.percent >= Self.thresholdPercent,
+                    let resetsAt = limit.resetsAt, resetsAt.timeIntervalSinceNow > 1
+                else { continue }
+                desired[Self.resetIdentifier(account: account, limit: limit, resetsAt: resetsAt)] =
+                    limit
+            }
         }
 
         // Only this account's requests are reconciled here, so concurrent
         // per-account refreshes never cancel each other's alerts.
-        let accountPrefix = "reset|\(account.id)|"
+        let accountPrefix = "\(Self.resetPrefix)\(account.id)|"
         let title = account.displayLabel
         let scheduler = self.scheduler
         scheduler.pendingIdentifiers { pendingIDs in
@@ -283,6 +362,10 @@ final class UsageNotifier: ObservableObject {
         }
     }
 
+    /// Marks every scheduled-ahead request as a reset alert, so they can be
+    /// told apart from anything scheduled later for another reason.
+    private static let resetPrefix = "reset|"
+
     /// "reset|account|limit|unixSeconds" — deterministic so rescheduling the
     /// same window replaces itself, and prefix-matchable per account (account
     /// ids are UUIDs, so the prefix stays unambiguous even though limit ids
@@ -291,7 +374,18 @@ final class UsageNotifier: ObservableObject {
     private static func resetIdentifier(
         account: AccountMeta, limit: LimitStatus, resetsAt: Date
     ) -> String {
-        "reset|\(account.id)|\(limit.id)|\(Int(resetsAt.timeIntervalSince1970))"
+        "\(resetPrefix)\(account.id)|\(limit.id)|\(Int(resetsAt.timeIntervalSince1970))"
+    }
+
+    /// Drops every queued reset alert across all accounts, for when the reset
+    /// kind is switched off mid-window.
+    private func removePendingResetAlerts() {
+        let scheduler = self.scheduler
+        scheduler.pendingIdentifiers { pendingIDs in
+            let resets = pendingIDs.filter { $0.hasPrefix(Self.resetPrefix) }
+            guard !resets.isEmpty else { return }
+            scheduler.removePending(identifiers: resets)
+        }
     }
 
     // MARK: - Posting

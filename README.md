@@ -50,6 +50,17 @@ time. Claude accounts with extra usage enabled also get a **Credits** bar
 showing spend against your monthly cap (or just the amount spent, when no cap
 is set).
 
+The dropdown is a display, not a control panel: everything configurable lives
+in a settings window, reachable from **Settings…** at the bottom of the
+dropdown (or ⌘, while it's open). **General** holds "Launch at login" and the
+notification switches — a master toggle plus one per alert (limit reaches 90%,
+limit resets, sign-in expires, suggest account switches), all on by default; **Accounts** holds the
+account list — add, rename, remove,
+reorder (drag a row by its grip, or use the ⌃/⌄ buttons; the order is also the
+menu bar's left-to-right order), and set each Claude account's quota weight.
+General ends with an **About** section: version and build (selectable, for bug
+reports), author, and a link to this repository.
+
 Every multi-day window (the weekly limits) has a collapsible **burndown
 chart**: quota left on the y-axis, descending across the window. A solid line
 for what's been recorded, a dashed continuation at the current burn rate
@@ -127,14 +138,14 @@ Requires macOS 14+ and Xcode command line tools. No dependencies.
 
 ## Adding accounts
 
-1. Click the gauge icon → **Add Claude Account…** or **Add Codex Account…** —
-   your browser opens the provider's authorization page. Approve, and the app
-   picks up the callback.
+1. Click the gauge icon → **Settings…** → **Accounts** → **Add Claude account**
+   or **Add Codex account** — your browser opens the provider's authorization
+   page. Approve, and the app picks up the callback.
 2. For a **second account on the same provider**: the browser will be logged
    into the first account, so use a private window or log out first.
 
-If a refresh token expires the account row shows "Sign-in expired" with a
-button to re-authenticate.
+If a refresh token expires the account row in the dropdown shows "Sign-in
+expired" with a button to re-authenticate.
 
 ## Notes
 

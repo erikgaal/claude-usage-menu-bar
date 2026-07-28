@@ -638,6 +638,37 @@ final class AccountStoreTests: XCTestCase {
         XCTAssertEqual(harness.store.accounts.map(\.id), ["c", "b", "a"])
     }
 
+    /// The drag-and-drop path: dropping on a row makes that row's index the
+    /// dragged account's new index.
+    func testMoveAccountToIndexReordersAndPersists() throws {
+        let a = makeAccount(id: "a")
+        let b = makeAccount(id: "b")
+        let c = makeAccount(id: "c")
+        let harness = makeHarness(accounts: [a, b, c])
+
+        XCTAssertTrue(harness.store.moveAccount(id: "c", to: 0))
+        XCTAssertEqual(harness.store.accounts.map(\.id), ["c", "a", "b"])
+        XCTAssertEqual(try decodedAccounts(in: harness.defaults).map(\.id), ["c", "a", "b"])
+
+        // Dragging the top row to the bottom: it lands at the last index.
+        XCTAssertTrue(harness.store.moveAccount(id: "c", to: 2))
+        XCTAssertEqual(harness.store.accounts.map(\.id), ["a", "b", "c"])
+    }
+
+    func testMoveAccountToIndexRefusesUnknownIDsAndNonMoves() throws {
+        let a = makeAccount(id: "a")
+        let b = makeAccount(id: "b")
+        let harness = makeHarness(accounts: [a, b])
+
+        // A foreign drag (text from another app) carries no known account id.
+        XCTAssertFalse(harness.store.moveAccount(id: "not-an-account", to: 0))
+        XCTAssertFalse(harness.store.moveAccount(id: "a", to: 0))  // already there
+        XCTAssertFalse(harness.store.moveAccount(id: "a", to: 2))  // past the end
+        XCTAssertFalse(harness.store.moveAccount(id: "a", to: -1))
+
+        XCTAssertEqual(harness.store.accounts.map(\.id), ["a", "b"])
+    }
+
     func testMoveAccountIgnoresOutOfRangeMoves() {
         let a = makeAccount(id: "a")
         let b = makeAccount(id: "b")
