@@ -23,8 +23,7 @@ final class UpdateChecker: ObservableObject {
         static let cachedRelease = "updateCachedRelease"
     }
 
-    private static let endpoint = URL(
-        string: "https://api.github.com/repos/erikgaal/claude-usage-menu-bar/releases/latest")!
+    private static let endpoint = AppInfo.latestReleaseAPI
     /// Once a day is plenty; combined with ETag caching, 304 responses don't
     /// count against GitHub's unauthenticated rate limit.
     private let checkInterval: TimeInterval = 24 * 60 * 60
@@ -116,7 +115,7 @@ final class UpdateChecker: ObservableObject {
     /// The running build's marketing version, or nil for dev builds. A bare
     /// executable launched via `swift run` has no Info.plist and no .app
     /// wrapper; both checks guard against nagging during development.
-    static var bundleVersion: String? {
+    nonisolated static var bundleVersion: String? {
         guard Bundle.main.bundleURL.pathExtension == "app",
             let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
                 as? String,
