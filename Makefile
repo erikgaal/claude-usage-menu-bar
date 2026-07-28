@@ -1,7 +1,7 @@
 APP_NAME = Claude Usage
 BUILD_DIR = build
 APP_BUNDLE = $(BUILD_DIR)/$(APP_NAME).app
-VERSION = 1.1.0
+VERSION = 1.2.0
 RELEASE_ZIP = $(BUILD_DIR)/Claude-Usage-$(VERSION).zip
 
 # Sign with a real identity when available so the app keeps the same code
@@ -53,8 +53,10 @@ bundle: build
 run: bundle
 	open "$(APP_BUNDLE)"
 
-# Universal (arm64 + x86_64) build, zipped for distribution. Ad-hoc signed:
-# recipients must approve it once via System Settings > Privacy & Security.
+# Universal (arm64 + x86_64) build, zipped for distribution. Signed with the
+# best identity available (see CODESIGN_ID); unless that's a Developer ID and
+# the zip goes through `make notarize`, recipients must approve it once via
+# System Settings > Privacy & Security.
 release:
 	swift build -c release --arch arm64 --arch x86_64
 	$(call assemble_bundle,.build/apple/Products/Release/ClaudeUsage)

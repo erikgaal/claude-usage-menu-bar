@@ -54,10 +54,10 @@ The dropdown is a display, not a control panel: everything configurable lives
 in a settings window, reachable from **Settings…** at the bottom of the
 dropdown (or ⌘, while it's open). **General** holds "Launch at login" and the
 notification switches — a master toggle plus one per alert (limit reaches 90%,
-limit resets, sign-in expires, suggest account switches), all on by default; **Accounts** holds the
-account list — add, rename, remove,
-reorder (drag a row by its grip, or use the ⌃/⌄ buttons; the order is also the
-menu bar's left-to-right order), and set each Claude account's quota weight.
+limit resets, sign-in expires, suggest account switches), all on by default;
+**Accounts** holds the account list — add, rename, remove, reorder (drag a row
+by its grip; the order is also the menu bar's left-to-right order), and set
+each Claude account's quota weight.
 General ends with an **About** section: version and build (selectable, for bug
 reports), author, and a link to this repository.
 
@@ -99,20 +99,20 @@ span half an hour, and a daily rhythm once it has watched a couple of days.
 Grab `Claude-Usage-x.y.z.zip` from the
 [releases page](https://github.com/erikgaal/claude-usage-menu-bar/releases),
 unzip, and drag **Claude Usage.app** into `/Applications`.
+[CHANGELOG.md](CHANGELOG.md) has what changed in each version.
 
-The app is ad-hoc signed (not notarized), so macOS will block the first
-launch. One-time fix:
+Released builds are signed with a Developer ID and notarized by Apple (with
+the ticket stapled), so they launch with no Gatekeeper warning and no `xattr`
+workaround. Verify a download yourself with
+`spctl -a -vv "/Applications/Claude Usage.app"` — it prints
+`source=Notarized Developer ID`.
 
-1. Double-click the app (macOS shows "cannot verify" — dismiss it),
-2. open **System Settings → Privacy & Security**, scroll down, and click
-   **Open Anyway** next to "Claude Usage".
+## Producing a notarized release
 
-Or from a terminal instead: `xattr -d com.apple.quarantine "/Applications/Claude Usage.app"`.
-
-## Notarizing (removes the Gatekeeper step)
-
-Anyone on the paid Apple Developer Program can produce a notarized build
-that installs with zero warnings. One-time setup on their machine:
+Releases need a paid Apple Developer Program identity, which is also what
+gives the app a stable code identity across versions — Keychain "Always Allow"
+grants survive an update instead of re-prompting. One-time setup on the
+signing machine:
 
 1. **Developer ID Application certificate** in the login keychain. Only the
    team's Account Holder can create one: [developer.apple.com/account →
@@ -132,6 +132,12 @@ Then, from a clone of this repo:
 make notarize   # signs with Developer ID, submits to Apple, staples, re-zips
 ```
 
+Cutting a version means moving the `Unreleased` section of
+[CHANGELOG.md](CHANGELOG.md) under a numbered heading, bumping
+`CFBundleShortVersionString` and `CFBundleVersion` in `Resources/Info.plist`,
+tagging, and using that section as the release notes — one description of the
+release rather than two that can drift.
+
 The build automatically prefers a Developer ID identity when one is present
 and signs with hardened runtime + timestamp (notarization requirements).
 Verify with `spctl -a -vv "build/Claude Usage.app"` — it should print
@@ -147,7 +153,7 @@ make notarize     # release + Apple notarization (needs Developer ID, see above)
 make screenshots  # regenerate docs/screenshot-{light,dark}.png from mock data
 ```
 
-Or step by step: `make build` (swift build), `make bundle` (assemble + ad-hoc
+Or step by step: `make build` (swift build), `make bundle` (assemble +
 codesign the .app), `make clean`.
 
 Requires macOS 14+ and Xcode command line tools. No dependencies.
