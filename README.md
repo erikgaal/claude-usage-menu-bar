@@ -99,6 +99,7 @@ span half an hour, and a daily rhythm once it has watched a couple of days.
 Grab `Claude-Usage-x.y.z.zip` from the
 [releases page](https://github.com/erikgaal/claude-usage-menu-bar/releases),
 unzip, and drag **Claude Usage.app** into `/Applications`.
+[CHANGELOG.md](CHANGELOG.md) has what changed in each version.
 
 Released builds are signed with a Developer ID and notarized by Apple (with
 the ticket stapled), so they launch with no Gatekeeper warning and no `xattr`
@@ -130,6 +131,12 @@ Then, from a clone of this repo:
 ```sh
 make notarize   # signs with Developer ID, submits to Apple, staples, re-zips
 ```
+
+Cutting a version means moving the `Unreleased` section of
+[CHANGELOG.md](CHANGELOG.md) under a numbered heading, bumping
+`CFBundleShortVersionString` and `CFBundleVersion` in `Resources/Info.plist`,
+tagging, and using that section as the release notes — one description of the
+release rather than two that can drift.
 
 The build automatically prefers a Developer ID identity when one is present
 and signs with hardened runtime + timestamp (notarization requirements).
