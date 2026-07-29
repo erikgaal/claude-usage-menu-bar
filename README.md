@@ -63,7 +63,7 @@ reports), author, and a link to this repository.
 
 Every multi-day window (the weekly limits) has a collapsible **burndown
 chart**: quota left on the y-axis, descending across the window. A solid line
-for what's been recorded, a dashed continuation at the current burn rate
+for what's been recorded, a dashed continuation for where you're heading
 (flattening along the floor if it gets there before the reset — that stretch is
 time you'd spend locked out), and a hairline diagonal for the pace that would
 spend the window exactly, so below the line is overspending and above it is
@@ -72,11 +72,27 @@ other way: `71% used · 29% left · on pace to land at 6%`, or the time it runs
 out. Charts are collapsed by default and each one remembers whether you opened
 it.
 
+The dashed projection follows **your daily rhythm** rather than a straight
+line. Nobody spends quota evenly around the clock, so a single burn rate
+carried across a weekly window spends it through every night too, and a chart
+opened at the end of a working day reads as far more alarming than it should.
+Instead, each limit learns how much it typically consumes in each hour of the
+day, and the projection replays that shape — standing still through the hours
+you're reliably idle, dropping through the hours you work. How *much* you're
+working is fitted separately over the last two days, so the level keeps up with
+a busy week while the shape stays steady. On real history this cuts a day-ahead
+projection's error by about a third, and the caption's run-out time lands in
+working hours instead of at 4am. Windows without enough history yet, and the
+five-hour session windows (too short to hold a day/night shape), keep the
+single fitted rate.
+
 Every poll's per-limit percents are appended to a local history file (one JSON
 file per account under Application Support, 14 days of 5-minute samples), which
-is where both the trend charts and the burn-rate projections come from. Nothing
-leaves your machine; a fresh install has a line to draw within minutes and a
-projection once three polls span half an hour.
+is where the trend charts and projections come from. The learned daily shape
+lives in a separate few-hundred-byte file per account, so it can keep
+accumulating after the raw samples are pruned. Nothing leaves your machine; a
+fresh install has a line to draw within minutes, a projection once three polls
+span half an hour, and a daily rhythm once it has watched a couple of days.
 
 ## Install (prebuilt app)
 
