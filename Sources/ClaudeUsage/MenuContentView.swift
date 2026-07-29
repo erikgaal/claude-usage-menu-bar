@@ -351,8 +351,7 @@ struct AccountSection: View {
         for limit in rows {
             // Low-utilization slopes extrapolate to noise; don't project them.
             guard limit.percent >= 25,
-                let projected = history.projectedExhaustion(
-                    accountID: accountID, limitID: limit.id),
+                let projected = history.projectedExhaustion(for: limit, accountID: accountID),
                 projected < resetsAt
             else { continue }
             if soonest == nil || projected < soonest!.at {

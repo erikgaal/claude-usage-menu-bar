@@ -10,10 +10,15 @@ import SwiftUI
 ///   one. The x-axis is the whole window, so a line that starts on Thursday
 ///   says plainly that nothing was recorded before then rather than pretending
 ///   the week began when polling did.
-/// - **Projected** — a dashed continuation at the same fitted pace the panel's
-///   own "on pace to run out" caption uses, so the two can never disagree. It
-///   flattens along the floor once the pace reaches zero; that flat stretch is
-///   the runway that would be spent locked out.
+/// - **Projected** — a dashed continuation from the same model the panel's own
+///   "on pace to run out" caption uses, so the two can never disagree. For a
+///   multi-day window with enough history it follows the account's learned
+///   hour-of-day rhythm (`ActivityProfile`): a staircase that stands still
+///   across the hours this account is reliably idle and drops across the hours
+///   it works, rather than a straight line that spends quota through every
+///   night. Windows without that history fall back to one fitted rate. Either
+///   way it flattens along the floor once the quota reaches zero; that flat
+///   stretch is the runway that would be spent locked out.
 /// - **Even pace** — the hairline diagonal from a full quota at the window's
 ///   start to zero at its reset: the pace that spends the budget exactly.
 ///   Below the line is overspending, above it is headroom.
