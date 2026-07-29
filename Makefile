@@ -42,7 +42,7 @@ define assemble_bundle
 	codesign --force $(CODESIGN_FLAGS) --sign "$(CODESIGN_ID)" "$(APP_BUNDLE)"
 endef
 
-.PHONY: build bundle run release notarize screenshots clean
+.PHONY: build bundle run release notarize publish screenshots clean
 
 build:
 	swift build -c release
@@ -78,6 +78,23 @@ notarize: release
 	rm -f "$(RELEASE_ZIP)"
 	ditto -c -k --sequesterRsrc --keepParent "$(APP_BUNDLE)" "$(RELEASE_ZIP)"
 	@echo "Notarized artifact: $(RELEASE_ZIP)"
+
+# Ships $(RELEASE_ZIP) as a GitHub release: tags HEAD as v$(VERSION) unless
+# the tag already exists, pushes the tag, and creates a draft release with
+# auto-generated notes and the zip attached. Left as a draft so the notes can
+# be reviewed before anything goes public. Requires `gh` authenticated as an
+# account with push access to origin (`gh auth switch` if needed).
+# Deliberately not a dependency of/on `notarize`: notarization takes minutes
+# and shouldn't rerun just to publish. Validates the staple instead, so an
+# un-notarized bundle can't be shipped by accident.
+publish:
+	@test -f "$(RELEASE_ZIP)" || { echo "error: $(RELEASE_ZIP) not found — run 'make notarize' first" >&2; exit 1; }
+	xcrun stapler validate "$(APP_BUNDLE)"
+	git rev-parse -q --verify "refs/tags/v$(VERSION)" > /dev/null || git tag "v$(VERSION)"
+	git push origin "v$(VERSION)"
+	gh release create "v$(VERSION)" --verify-tag --draft --generate-notes "$(RELEASE_ZIP)"
+	@echo "Draft created — review the notes, then run:"
+	@echo "  gh release edit v$(VERSION) --draft=false"
 
 # Regenerates docs/screenshot-{light,dark}.png from mock data (debug-only,
 # see Sources/ClaudeUsage/MockSupport.swift). Briefly opens the panel on
