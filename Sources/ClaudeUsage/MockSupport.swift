@@ -92,8 +92,9 @@ enum Mock {
     ///
     /// Shape: recording starts a few hours into the window, climbs in daily
     /// bursts separated by flat overnight stretches, and lands exactly on the
-    /// limit's current percent — then projects from the most recent burst's
-    /// pace, the same way the real fit does.
+    /// limit's current percent — then projects that same daily rhythm forward,
+    /// through an `ActivityProfile` folded from the series itself, so the
+    /// screenshot shows the real staircase and not a stand-in for it.
     static func trend(for limit: LimitStatus, windowStart: Date, windowEnd: Date)
         -> UsageTrend?
     {
@@ -102,7 +103,9 @@ enum Mock {
         guard now > start.addingTimeInterval(3600) else { return nil }
 
         let span = now.timeIntervalSince(start)
-        let steps = 96
+        // Quarter-hour resolution: fine enough that folding it into hour-of-day
+        // cells recovers the rhythm rather than smearing it across them.
+        let steps = max(96, Int(span / (15 * 60)))
         // Fraction of the total climb completed by each step: flat at night
         // (a cosine trough), steeper by day, normalized to end at 1.
         var shape: [Double] = []
@@ -112,24 +115,33 @@ enum Mock {
             total += max(0.05, 0.5 + 0.5 * cos(phase))
             shape.append(total)
         }
-        let recorded = shape.enumerated().map { index, cumulative in
+        let fine = shape.enumerated().map { index, cumulative in
             UsageTrend.Point(
                 date: start.addingTimeInterval(span * Double(index) / Double(steps - 1)),
                 percent: limit.percent * cumulative / total)
         }
+        guard let latest = fine.last else { return nil }
 
-        guard let latest = recorded.last else { return nil }
-        // Recent pace: the last eighth of the series, which is where a real
-        // 12-hour fit would be looking.
-        let earlier = recorded[recorded.count - steps / 8]
-        let hours = latest.date.timeIntervalSince(earlier.date) / 3600
-        let rate = hours > 0 ? max(0, (latest.percent - earlier.percent) / hours) : 0
+        var profile = ActivityProfile()
+        for (previous, next) in zip(fine, fine.dropFirst()) {
+            profile.add(
+                points: next.percent - previous.percent, from: previous.date, to: next.date)
+        }
+        // The profile was folded from exactly this series, so it already
+        // expects what just happened: the level needs no correction.
         let projection = UsageTrend.project(
-            from: latest, ratePerHour: rate, windowEnd: windowEnd)
+            from: latest, profile: profile, scale: 1, windowEnd: windowEnd)
+
+        // Thin for drawing, the way the store does — the ends must survive.
+        let step = max(1, fine.count / 96)
+        var recorded = stride(from: 0, to: fine.count, by: step).map { fine[$0] }
+        if recorded.last?.date != latest.date { recorded.append(latest) }
+
         return UsageTrend(
             windowStart: windowStart, windowEnd: windowEnd, recorded: recorded,
-            projected: projection.points, ratePerHour: rate,
-            projectedAtReset: projection.atReset, exhaustsAt: projection.exhaustsAt)
+            projected: projection.points, ratePerHour: nil,
+            projectedAtReset: projection.atReset, exhaustsAt: projection.exhaustsAt,
+            projection: .dailyPattern)
     }
 
     // MARK: - Screenshot sequence

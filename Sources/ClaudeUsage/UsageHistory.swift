@@ -31,6 +31,24 @@ struct UsageTrend: Equatable {
         var id: Date { date }
     }
 
+    /// Which shape `projected` follows. Worth naming rather than inferring
+    /// from the point count: the two models answer the same question in
+    /// different units, and a test that means to exercise one must not
+    /// silently pass on the other.
+    enum Projection: Equatable {
+        /// Nothing to project — history too thin, or the window already over.
+        case unavailable
+        /// One constant fitted %/hour carried to the reset. What every window
+        /// got before daily patterns existed, and still what a five-hour
+        /// session gets: there is no day/night shape inside five hours to use,
+        /// and holding session projections still leaves the Best badge and the
+        /// switch notifications exactly as they were.
+        case constantRate
+        /// The account's learned hour-of-day intensity, scaled to how hard it
+        /// is currently being used. Multi-day windows only.
+        case dailyPattern
+    }
+
     /// Start of the current window (`resetsAt - windowSeconds`) — the x-axis
     /// origin and the anchor of the even-pace reference.
     let windowStart: Date
@@ -43,13 +61,33 @@ struct UsageTrend: Equatable {
     /// there's no fittable pace. Flattens at 100% when the pace gets there
     /// first, since usage can't exceed the cap.
     let projected: [Point]
-    /// Fitted fill rate in percentage points per hour, nil when unfittable.
+    /// Recent average fill rate in percentage points per hour, nil when
+    /// unfittable. Still the straight-line least-squares fit even when
+    /// `projection` is `.dailyPattern` — in that case it describes the pace
+    /// just gone, *not* the slope of the dashed line, which has no single one.
     let ratePerHour: Double?
-    /// Where the current pace lands at reset, *uncapped* — above 100 means
-    /// the window runs out first, which is the interesting case.
+    /// Where the projection lands at reset, *uncapped* — above 100 means the
+    /// window runs out first, which is the interesting case.
     let projectedAtReset: Double?
     /// When the projection crosses 100%, if that happens before the reset.
     let exhaustsAt: Date?
+    /// Which model drew `projected`.
+    let projection: Projection
+
+    init(
+        windowStart: Date, windowEnd: Date, recorded: [Point], projected: [Point],
+        ratePerHour: Double?, projectedAtReset: Double?, exhaustsAt: Date?,
+        projection: Projection = .constantRate
+    ) {
+        self.windowStart = windowStart
+        self.windowEnd = windowEnd
+        self.recorded = recorded
+        self.projected = projected
+        self.ratePerHour = ratePerHour
+        self.projectedAtReset = projectedAtReset
+        self.exhaustsAt = exhaustsAt
+        self.projection = projected.isEmpty ? .unavailable : projection
+    }
 
     /// Newest recorded observation — the "you are here" point.
     var latest: Point { recorded[recorded.count - 1] }
@@ -72,6 +110,60 @@ struct UsageTrend: Equatable {
             [latest, Point(date: crossing, percent: 100), Point(date: windowEnd, percent: 100)],
             atReset, crossing
         )
+    }
+
+    /// Walks an `ActivityProfile` forward from the newest observation to the
+    /// window's end, spending `scale` times the profile's expected points each
+    /// hour. The result is a staircase — flat across the hours this account is
+    /// reliably idle, steep across the hours it works — which is the same
+    /// shape the recorded line has, so the dashed continuation finally reads
+    /// as a continuation instead of an alien ramp.
+    ///
+    /// One vertex per local hour boundary. Because intensity is constant
+    /// within a cell, that polyline is the model exactly rather than a
+    /// sampling of it, and a week caps out at 168 points — the same order as
+    /// the thinned recorded series.
+    ///
+    /// Like the constant-rate projection this flattens at 100% and reports the
+    /// crossing, and `atReset` stays uncapped so callers can still tell "just
+    /// barely" from "days ago".
+    static func project(
+        from latest: Point, profile: ActivityProfile, scale: Double, windowEnd: Date,
+        calendar: Calendar = .current
+    ) -> (points: [Point], atReset: Double, exhaustsAt: Date?) {
+        var vertices = [latest]
+        var percent = latest.percent
+        var crossing: Date?
+        var cursor = latest.date
+
+        while cursor < windowEnd {
+            let boundary = calendar.dateInterval(of: .hour, for: cursor)?.end
+            let next = min(windowEnd, boundary ?? windowEnd)
+            guard next > cursor else { break }
+
+            let before = percent
+            percent += scale * profile.expectedPoints(from: cursor, to: next, calendar: calendar)
+            // Land the crossing on the minute it happens rather than on the
+            // hour that contains it: this is the figure the caption turns into
+            // "on pace to run out 16:19".
+            if crossing == nil, percent >= 100, percent > before {
+                let fraction = (100 - before) / (percent - before)
+                let at = cursor.addingTimeInterval(next.timeIntervalSince(cursor) * fraction)
+                if at < next {
+                    crossing = at
+                    vertices.append(Point(date: at, percent: 100))
+                } else {
+                    crossing = next
+                }
+            }
+            vertices.append(Point(date: next, percent: min(100, percent)))
+            cursor = next
+        }
+
+        // A window whose reset is already behind the newest sample leaves
+        // nothing to draw; the caller treats an empty path as no projection.
+        guard vertices.count > 1 else { return ([], latest.percent, nil) }
+        return (vertices, percent, crossing)
     }
 }
 
@@ -100,10 +192,34 @@ final class UsageHistoryStore {
     /// Percent can only fall when the window resets, so a drop bigger than
     /// rounding jitter marks a window boundary that projections must not cross.
     private let resetDropThreshold = 5.0
+    /// Longest gap between two samples still treated as observed time. Past
+    /// this the app was asleep or quit, and the stretch is unknowable rather
+    /// than idle: crediting it as idle would flatten the learned pattern, and
+    /// crediting the whole jump to one hour would spike it.
+    private let maximumObservedGap: TimeInterval = 30 * 60
+    /// A window pinned at its cap records no growth however hard it is being
+    /// used, so those stretches teach the pattern nothing and are left out.
+    private let saturationFloor = 99.5
+    /// How far back the *level* of current activity is fitted. Two days spans
+    /// enough day/night cycles that the answer doesn't depend on the hour it
+    /// is asked — which it can afford to, because the profile now carries the
+    /// within-day variation that a short lookback used to chase.
+    private let calibrationSpan: TimeInterval = 48 * 3600
+    /// Minimum observed time inside that span before a level is trusted.
+    private let minimumCalibrationHours: Double = 6
+    /// Ceiling on the level multiple. Guards the case where the profile
+    /// expects almost nothing of the hours just gone but they were busy
+    /// anyway: without it, dividing by a near-zero expectation projects a
+    /// wall.
+    private let maximumScale = 3.0
 
     private let directory: URL
     /// In-memory copy of each account's file, so polls don't re-read disk.
     private var cache: [String: [UsageSample]] = [:]
+    /// Learned hour-of-day profiles, per account then per limit. Separate
+    /// files from the samples: they outlive `retention` by design, and they're
+    /// small enough that rewriting one per poll costs nothing.
+    private var profileCache: [String: [String: ActivityProfile]] = [:]
 
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
@@ -116,12 +232,19 @@ final class UsageHistoryStore {
         return decoder
     }()
 
-    init(directory: URL? = nil) {
+    /// Resolves the local hours a pattern is keyed on. Injectable only so
+    /// tests can pin a zone: a fixture that means "busy at 14:00" would
+    /// otherwise assert something different on a UTC runner than on a machine
+    /// in London.
+    private let calendar: Calendar
+
+    init(directory: URL? = nil, calendar: Calendar = .current) {
         self.directory =
             directory
             ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
             .appendingPathComponent("dev.erikgaal.claude-usage/history", isDirectory: true)
+        self.calendar = calendar
     }
 
     // MARK: - Recording
@@ -155,13 +278,125 @@ final class UsageHistoryStore {
         }
         cache[accountID] = samples
         persist(samples, accountID: accountID)
+        learnPattern(accountID: accountID)
     }
 
     /// Drops an account's history (called when the account is removed) so
     /// stale files don't accumulate in Application Support.
     func removeHistory(accountID: String) {
         cache[accountID] = nil
+        profileCache[accountID] = nil
         try? FileManager.default.removeItem(at: fileURL(accountID: accountID))
+        try? FileManager.default.removeItem(at: profileURL(accountID: accountID))
+    }
+
+    // MARK: - Learning the daily pattern
+
+    /// Folds everything not yet folded into each limit's hour-of-day profile.
+    ///
+    /// Driven off the stored samples rather than off the poll that just landed,
+    /// so one code path covers both the incremental case and the first run
+    /// against history recorded before profiles existed — an install that
+    /// upgrades gets a usable pattern immediately instead of waiting days for
+    /// one to accumulate. `ActivityProfile.add` ignores stretches at or before
+    /// its watermark, which is what makes re-folding free.
+    private func learnPattern(accountID: String) {
+        var learned = profiles(for: accountID)
+        var byLimit: [String: [UsageSample]] = [:]
+        for sample in samples(for: accountID) {
+            byLimit[sample.limitID, default: []].append(sample)
+        }
+        for (limitID, rows) in byLimit {
+            var profile = learned[limitID] ?? ActivityProfile()
+            for (previous, next) in zip(rows, rows.dropFirst()) {
+                guard let step = usableInterval(from: previous, to: next) else { continue }
+                profile.add(
+                    points: step.points, from: step.start, to: step.end,
+                    calendar: calendar)
+            }
+            learned[limitID] = profile
+        }
+        profileCache[accountID] = learned
+        persistProfiles(learned, accountID: accountID)
+    }
+
+    /// One stretch of genuinely observed time between consecutive samples, or
+    /// nil when nothing can honestly be attributed to it — the single
+    /// definition of "usable" shared by the profile and the level fit, so the
+    /// two can't disagree about what counts as evidence.
+    private func usableInterval(from previous: UsageSample, to next: UsageSample)
+        -> (start: Date, end: Date, points: Double)?
+    {
+        let span = next.timestamp.timeIntervalSince(previous.timestamp)
+        guard span > 0, span <= maximumObservedGap else { return nil }
+        // A reset makes the delta meaningless; the cap makes it censored.
+        guard next.percent - previous.percent >= -resetDropThreshold else { return nil }
+        guard previous.percent < saturationFloor else { return nil }
+        return (previous.timestamp, next.timestamp, max(0, next.percent - previous.percent))
+    }
+
+    /// How hard a limit is being used right now, as a multiple of what its
+    /// profile expects of the same hours. This is the *level*, the fast-moving
+    /// half of the forecast; the profile supplies the shape.
+    ///
+    /// Expectation accumulates over observed stretches only, never over
+    /// wall-clock — an app quit for half the calibration span must not have
+    /// its usage divided by two days of expected demand.
+    ///
+    /// Deliberately *not* trimmed at the last window reset, unlike everything
+    /// the chart draws. How hard someone is working is a fact about them, not
+    /// about which window their usage was billed to, so a window that renewed
+    /// this morning still gets a level fitted from yesterday instead of
+    /// falling back to a straight line for two days. The reset itself
+    /// contributes nothing: `usableInterval` drops the stretch it lands in.
+    ///
+    /// Nil means "don't project a pattern": either too little was observed, or
+    /// the profile expects so little of these hours that the ratio would be
+    /// noise. Both fall back to the straight line.
+    private func activityScale(
+        accountID: String, limitID: String, profile: ActivityProfile, asOf now: Date
+    ) -> Double? {
+        let cutoff = now.addingTimeInterval(-calibrationSpan)
+        let rows = samples(for: accountID).filter {
+            $0.limitID == limitID && $0.timestamp >= cutoff && $0.timestamp <= now
+        }
+        var observed = 0.0
+        var actual = 0.0
+        var expected = 0.0
+        for (previous, next) in zip(rows, rows.dropFirst()) {
+            guard let step = usableInterval(from: previous, to: next) else { continue }
+            observed += step.end.timeIntervalSince(step.start) / 3600
+            actual += step.points
+            expected += profile.expectedPoints(
+                from: step.start, to: step.end, calendar: calendar)
+        }
+        guard observed >= minimumCalibrationHours else { return nil }
+        // Genuinely idle is a real answer, and the only one that keeps an
+        // untouched account's projection flat.
+        guard actual > 0 else { return 0 }
+        guard expected >= 0.5 else { return nil }
+        return min(maximumScale, actual / expected)
+    }
+
+    /// The pattern-shaped projection for one limit, or nil when the account
+    /// hasn't earned one yet. Gated on `isMultiDay`: a five-hour session has
+    /// no day/night shape inside it to exploit, and leaving it alone keeps the
+    /// Best badge and the switch notifications on exactly the behavior they
+    /// were built and tested against.
+    private func patternProjection(
+        for limit: LimitStatus, accountID: String, latest: UsageTrend.Point, windowEnd: Date
+    ) -> (points: [UsageTrend.Point], atReset: Double, exhaustsAt: Date?)? {
+        guard limit.isMultiDay, latest.date < windowEnd else { return nil }
+        guard let profile = profiles(for: accountID)[limit.id], profile.isUsable else { return nil }
+        guard
+            let scale = activityScale(
+                accountID: accountID, limitID: limit.id, profile: profile, asOf: latest.date)
+        else { return nil }
+
+        let projection = UsageTrend.project(
+            from: latest, profile: profile, scale: scale, windowEnd: windowEnd,
+            calendar: calendar)
+        return projection.points.isEmpty ? nil : projection
     }
 
     // MARK: - Burn rate & projection
@@ -182,6 +417,34 @@ final class UsageHistoryStore {
         else { return nil }
         let hoursLeft = (100 - latest.percent) / rate
         return latest.timestamp.addingTimeInterval(hoursLeft * 3600)
+    }
+
+    /// The same question, asked with the limit in hand so a multi-day window
+    /// can be answered from its daily pattern instead of a flat rate.
+    ///
+    /// Callers that only have a limit id keep the flat answer. Everything the
+    /// panel prints next to a chart must come through here: the chart's own
+    /// caption reads `UsageTrend.exhaustsAt`, and the reset line above it reads
+    /// this — two models would put two different times on one card.
+    func projectedExhaustion(for limit: LimitStatus, accountID: String) -> Date? {
+        guard limit.isMultiDay, let windowStart = limit.windowStart, let windowEnd = limit.resetsAt
+        else { return projectedExhaustion(accountID: accountID, limitID: limit.id) }
+        // The same window-restricted samples `trend(for:)` reads, so both land
+        // on the same "you are here" — thinning preserves the newest exactly.
+        guard
+            let newest = windowSamples(
+                accountID: accountID, limitID: limit.id, since: windowStart).last,
+            newest.percent < 100
+        else { return projectedExhaustion(accountID: accountID, limitID: limit.id) }
+
+        let latest = UsageTrend.Point(date: newest.timestamp, percent: newest.percent)
+        guard
+            let patterned = patternProjection(
+                for: limit, accountID: accountID, latest: latest, windowEnd: windowEnd)
+        else { return projectedExhaustion(accountID: accountID, limitID: limit.id) }
+        // Bounded by the reset, exactly as the chart's dashed line is: a
+        // crossing that would land after the window renews is a non-event.
+        return patterned.exhaustsAt
     }
 
     // MARK: - Trend series
@@ -214,10 +477,25 @@ final class UsageHistoryStore {
         // it agrees with the pace caption; clamp the noise floor at zero
         // because a window's usage never falls except at its reset.
         let rate = fit(accountID: accountID, limitID: limit.id).map { max(0, $0.ratePerHour) }
+
+        // A multi-day window that has earned a pattern gets the staircase;
+        // everything else keeps the straight line. The pattern needs no fitted
+        // rate of its own, so it can draw a window whose flat fit was rejected.
+        if let patterned = patternProjection(
+            for: limit, accountID: accountID, latest: latest, windowEnd: windowEnd)
+        {
+            return UsageTrend(
+                windowStart: windowStart, windowEnd: windowEnd, recorded: recorded,
+                projected: patterned.points, ratePerHour: rate,
+                projectedAtReset: patterned.atReset, exhaustsAt: patterned.exhaustsAt,
+                projection: .dailyPattern)
+        }
+
         guard let rate, latest.date < windowEnd else {
             return UsageTrend(
                 windowStart: windowStart, windowEnd: windowEnd, recorded: recorded,
-                projected: [], ratePerHour: rate, projectedAtReset: nil, exhaustsAt: nil)
+                projected: [], ratePerHour: rate, projectedAtReset: nil, exhaustsAt: nil,
+                projection: .unavailable)
         }
 
         let projection = UsageTrend.project(
@@ -225,7 +503,8 @@ final class UsageHistoryStore {
         return UsageTrend(
             windowStart: windowStart, windowEnd: windowEnd, recorded: recorded,
             projected: projection.points, ratePerHour: rate,
-            projectedAtReset: projection.atReset, exhaustsAt: projection.exhaustsAt)
+            projectedAtReset: projection.atReset, exhaustsAt: projection.exhaustsAt,
+            projection: .constantRate)
     }
 
     /// Every sample for one limit inside the current window. Unlike
@@ -367,10 +646,46 @@ final class UsageHistoryStore {
         try? data.write(to: fileURL(accountID: accountID), options: .atomic)
     }
 
+    /// Learned profiles for one account, keyed by limit id. A profile is only
+    /// ever a cache of what the samples already say, so anything that fails to
+    /// decode — or decodes with the wrong cell count — is dropped and rebuilt
+    /// by the next `learnPattern` rather than migrated.
+    private func profiles(for accountID: String) -> [String: ActivityProfile] {
+        if let cached = profileCache[accountID] { return cached }
+        var loaded: [String: ActivityProfile] = [:]
+        if let data = try? Data(contentsOf: profileURL(accountID: accountID)),
+            let decoded = try? decoder.decode([String: ActivityProfile].self, from: data)
+        {
+            loaded = decoded.filter { $0.value.isWellFormed }
+        }
+        profileCache[accountID] = loaded
+        // Nothing on disk but samples to learn from: the first launch after an
+        // upgrade, or a profile file that failed to decode. Build it now rather
+        // than drawing straight lines until the next poll lands — `learnPattern`
+        // reads this cache, which is already primed, so it can't recurse.
+        if loaded.isEmpty, !samples(for: accountID).isEmpty {
+            learnPattern(accountID: accountID)
+            return profileCache[accountID] ?? loaded
+        }
+        return loaded
+    }
+
+    private func persistProfiles(_ profiles: [String: ActivityProfile], accountID: String) {
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let data = try? encoder.encode(profiles) else { return }
+        try? data.write(to: profileURL(accountID: accountID), options: .atomic)
+    }
+
     private func fileURL(accountID: String) -> URL {
+        directory.appendingPathComponent("\(safeName(accountID)).json")
+    }
+
+    private func profileURL(accountID: String) -> URL {
+        directory.appendingPathComponent("\(safeName(accountID)).pattern.json")
+    }
+
+    private func safeName(_ accountID: String) -> String {
         // Account IDs are UUIDs today, but don't trust them as file names.
-        let safe = String(
-            accountID.map { $0.isLetter || $0.isNumber || "-._".contains($0) ? $0 : "_" })
-        return directory.appendingPathComponent("\(safe).json")
+        String(accountID.map { $0.isLetter || $0.isNumber || "-._".contains($0) ? $0 : "_" })
     }
 }
